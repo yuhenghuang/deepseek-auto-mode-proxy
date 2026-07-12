@@ -59,7 +59,7 @@ Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](http
 
 ## How patching works
 
-Claude Code v2.1.160+ already sets `reasoning_effort` on classifier requests to reduce thinking time, but DeepSeek's API appears to ignore it (observed via benchmarking, not documented by DeepSeek). The proxy strips `reasoning_effort` and replaces it with two parameters DeepSeek does respect: `thinking` (binary on/off) and `output_config.effort` (output generation effort).
+Claude Code v2.1.205 sends classifier requests without `reasoning_effort` or `output_config` — verified via verbose proxy logging. The timeout is caused by DeepSeek's default thinking mode combined with the classifier's large input size (~200K chars transcript + ~106K chars system prompt). The proxy injects `thinking` and `output_config.effort`, the two parameters benchmarking shows DeepSeek respects.
 
 ## Health check
 

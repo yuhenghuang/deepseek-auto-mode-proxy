@@ -153,9 +153,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             data = json.loads(raw_body)
             if _is_classifier(data):
+                if self.verbose:
+                    log.info("[classifier] re=%s oc=%s → thinking=%s effort=%s %s",
+                             "yes" if data.get("reasoning_effort") else "no",
+                             "yes" if data.get("output_config") else "no",
+                             _PROXY_THINKING, _PROXY_EFFORT, self.path)
+                else:
+                    log.info("[classifier] thinking=%s effort=%s %s", _PROXY_THINKING, _PROXY_EFFORT, self.path)
                 data = _patch_classifier(data)
                 raw_body = json.dumps(data).encode("utf-8")
-                log.info("[classifier] thinking=%s effort=%s %s", _PROXY_THINKING, _PROXY_EFFORT, self.path)
             else:
                 # Check: structural criteria match but signature failed?
                 # This may indicate a Claude Code update changed the prompt.
@@ -165,11 +171,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         "classifier signature not detected, request passed through unpatched"
                     )
                 if self.verbose:
-                    log.info("[pass] stream=%s tools=%d msgs=%d sys=%s %s",
+                    log.info("[pass] stream=%s tools=%d msgs=%d sys=%s re=%s oc=%s %s",
                              bool(data.get("stream")),
                              len(data.get("tools", [])),
                              len(data.get("messages", [])),
                              "yes" if data.get("system") else "no",
+                             "yes" if data.get("reasoning_effort") else "no",
+                             "yes" if data.get("output_config") else "no",
                              self.path)
                 else:
                     log.info("[pass] %s", self.path)
