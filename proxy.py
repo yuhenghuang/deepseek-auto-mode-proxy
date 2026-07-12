@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import ssl
+import sys
 from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
@@ -280,7 +281,17 @@ def main() -> None:
     ProxyHandler.upstream_base_path = parsed.path or ""
     ProxyHandler.upstream_use_tls = parsed.scheme == "https"
 
-    server = _ThreadedHTTPServer(("127.0.0.1", args.port), ProxyHandler)
+    try:
+        server = _ThreadedHTTPServer(("127.0.0.1", args.port), ProxyHandler)
+    except OSError as exc:
+        log.error("Cannot bind to port %d: %s", args.port, exc)
+        log.error(
+            "The proxy may already be running. Check with: "
+            "curl http://127.0.0.1:%d/health",
+            args.port,
+        )
+        raise SystemExit(1)
+
     log.info("DeepSeek auto-mode proxy listening on http://127.0.0.1:%d", args.port)
     log.info("Upstream: %s", args.upstream)
     log.info(
