@@ -28,6 +28,22 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8799
 claude
 ```
 
+Stop the proxy:
+
+```bash
+python3 proxy.py --stop
+```
+
+## Configuration
+
+| Variable / flag | Values | Default |
+|---|---|---|
+| `PROXY_THINKING` | `disabled`, `enabled` | `enabled` |
+| `PROXY_EFFORT` | `low`, `medium`, `high` | `medium` |
+| `--port` | any port | `8799` |
+| `--upstream` | any URL | `https://api.deepseek.com/anthropic` |
+| `--stop` | — | Stop running instance and exit |
+
 ## How detection works
 
 Classifier requests are identified by 4 criteria (all must match):
@@ -38,13 +54,6 @@ Classifier requests are identified by 4 criteria (all must match):
 4. System prompt starts with `"You are a security monitor for autonomous AI coding agents."` — unique classifier fingerprint
 
 Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds content-level certainty. False positives are impossible in practice.
-
-| Variable | Values | Default |
-|---|---|---|
-| `PROXY_THINKING` | `disabled`, `enabled` | `enabled` |
-| `PROXY_EFFORT` | `low`, `medium`, `high` | `medium` |
-| `--port` | any port | `8799` |
-| `--upstream` | any URL | `https://api.deepseek.com/anthropic` |
 
 ## Health check
 

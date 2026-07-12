@@ -48,6 +48,7 @@ import http.server
 import json
 import logging
 import os
+import signal
 import ssl
 import sys
 from urllib.parse import urlparse
@@ -55,6 +56,7 @@ from urllib.parse import urlparse
 log = logging.getLogger("deepseek-proxy")
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
+PID_FILE = "/tmp/deepseek-proxy.pid"
 
 # Hop-by-hop headers — must not be forwarded in either direction (RFC 2616 §13.5.1)
 _HOP_BY_HOP = frozenset({
@@ -251,6 +253,40 @@ class _ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _stop_existing(port: int) -> None:
+    """Stop a running proxy instance on *port* by PID file or port match."""
+    # Try PID file first
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        log.info("Stopped proxy (PID %d from %s)", pid, PID_FILE)
+        os.remove(PID_FILE)
+        return
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+
+    # Fallback: find by port
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True
+        )
+        for line in result.stdout.splitlines():
+            if f":{port}" in line:
+                # Extract PID from ss output: pid=12345
+                for part in line.split():
+                    if part.startswith("pid="):
+                        pid = int(part.split("=")[1].rstrip(","))
+                        os.kill(pid, signal.SIGTERM)
+                        log.info("Stopped proxy (PID %d bound to port %d)", pid, port)
+                        return
+        log.warning("No running proxy found on port %d", port)
+    except Exception as exc:
+        log.error("Failed to stop existing proxy: %s", exc)
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="DeepSeek auto-mode classifier proxy"
@@ -263,6 +299,10 @@ def main() -> None:
         "--upstream", type=str, default=DEFAULT_UPSTREAM,
         help="Upstream API base URL (default: %(default)s)",
     )
+    parser.add_argument(
+        "--stop", action="store_true",
+        help="Stop any running proxy on the given port and exit",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -270,6 +310,10 @@ def main() -> None:
         format="%(asctime)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.stop:
+        _stop_existing(args.port)
+        return
 
     # Parse upstream into static handler attributes (avoids re-parsing per request)
     parsed = urlparse(args.upstream)
@@ -292,6 +336,10 @@ def main() -> None:
         )
         raise SystemExit(1)
 
+    # Write PID file for --stop support
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     log.info("DeepSeek auto-mode proxy listening on http://127.0.0.1:%d", args.port)
     log.info("Upstream: %s", args.upstream)
     log.info(
@@ -304,6 +352,11 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Shutting down")
         server.shutdown()
+    finally:
+        try:
+            os.remove(PID_FILE)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
