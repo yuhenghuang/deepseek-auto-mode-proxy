@@ -55,6 +55,8 @@ Classifier requests are identified by 4 criteria (all must match):
 
 Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds content-level certainty. False positives are impossible in practice.
 
+> **Note:** Criterion 4 depends on the classifier's system prompt signature. If Anthropic changes this prompt in a future Claude Code release, the proxy will silently stop patching classifier requests. After upgrading Claude Code, verify the proxy log still shows `[classifier]` entries. If structural criteria (1–3) match but the signature doesn't, the proxy logs `[structural match — possible prompt change]` as a warning.
+
 ## Health check
 
 ```bash

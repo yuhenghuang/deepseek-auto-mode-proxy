@@ -153,6 +153,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 raw_body = json.dumps(data).encode("utf-8")
                 log.info("[classifier] thinking=%s effort=%s %s", _PROXY_THINKING, _PROXY_EFFORT, self.path)
             else:
+                # Check: structural criteria match but signature failed?
+                # This may indicate a Claude Code update changed the prompt.
+                if not data.get("stream") and not data.get("tools") and len(data.get("messages", [])) == 1:
+                    log.warning(
+                        "[structural match — possible prompt change] "
+                        "classifier signature not detected, request passed through unpatched"
+                    )
                 log.info("[pass] %s", self.path)
         except json.JSONDecodeError:
             log.info("[non-json pass] %s", self.path)
