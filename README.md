@@ -66,7 +66,7 @@ Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](http
 
 ## How patching works
 
-Claude Code v2.1.205 sends classifier requests with `max_tokens=2112` and no `thinking`, `reasoning_effort`, or `output_config` — verified via verbose proxy logging. With no `thinking` param, DeepSeek seems to default to full thinking on the classifier's large input (~300K chars total), causing the 28–32s timeout. With `thinking: disabled`, the same request completes in 1–2s. The proxy injects `thinking` and `output_config.effort` to regain control.
+Claude Code v2.1.205 sends classifier requests with `max_tokens=2112` and no `thinking`, `reasoning_effort`, or `output_config` — verified via verbose proxy logging. With no `thinking` param, DeepSeek seems to default to full thinking on the classifier's large input (~300K chars total), causing 28–32s response times. Claude Code appears to enforce a ~30s internal deadline on classifier responses (hypothesis — not documented; `API_TIMEOUT_MS` defaults to 10 min and [auto-mode config](https://code.claude.com/docs/en/auto-mode-config) lists no timeout setting). With `thinking: disabled`, responses complete in 1–3s, well within any plausible deadline. The proxy injects `thinking` and `output_config.effort` to regain control.
 
 ## Health check
 
