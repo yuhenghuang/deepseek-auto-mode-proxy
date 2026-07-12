@@ -44,11 +44,12 @@ python3 proxy.py --stop
 
 | Variable / flag  | Values                  | Default                              |
 | ---------------- | ----------------------- | ------------------------------------ |
-| `PROXY_THINKING` | `disabled`, `enabled`   | `disabled`                            |
-| `PROXY_EFFORT`   | `low`, `medium`, `high` | `low`                             |
+| `PROXY_THINKING` | `disabled`, `enabled`   | `disabled`                          |
+| `PROXY_EFFORT`   | `low`, `medium`, `high` | `low`                               |
 | `--port`         | any port                | `8799`                               |
 | `--upstream`     | any URL                 | `https://api.deepseek.com/anthropic` |
 | `--stop`         | —                       | Stop running instance and exit       |
+| `-v`, `--verbose` | —                     | Log request details for debugging    |
 
 ## How detection works
 
@@ -65,7 +66,7 @@ Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](http
 
 ## How patching works
 
-Claude Code v2.1.205 sends classifier requests with `max_tokens=2112` (v2.1.205) and no `thinking`, `reasoning_effort`, or `output_config` — verified via verbose proxy logging. With no `thinking` param, DeepSeek seems to default to full thinking on the classifier's large input (~300K chars total), causing the 28–32s timeout. With `thinking: disabled`, the same request completes in 1–2s. The proxy injects `thinking` and `output_config.effort` to regain control.
+Claude Code v2.1.205 sends classifier requests with `max_tokens=2112` and no `thinking`, `reasoning_effort`, or `output_config` — verified via verbose proxy logging. With no `thinking` param, DeepSeek seems to default to full thinking on the classifier's large input (~300K chars total), causing the 28–32s timeout. With `thinking: disabled`, the same request completes in 1–2s. The proxy injects `thinking` and `output_config.effort` to regain control.
 
 ## Health check
 

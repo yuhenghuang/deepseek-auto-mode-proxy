@@ -23,7 +23,7 @@ All other requests pass through unchanged — streaming, tool calls, conversatio
 
 Usage::
 
-    python3 proxy.py [--port PORT] [--upstream URL]
+    python3 proxy.py [--port PORT] [--upstream URL] [-v|--verbose] [--stop]
 
 Environment::
 
@@ -76,8 +76,8 @@ _CLASSIFIER_SIGNATURE = (
 )
 
 # Default patching behaviour — can be overridden via env vars.
-# PROXY_THINKING: "disabled" | "enabled" (default: "enabled")
-# PROXY_EFFORT: "low" | "medium" | "high" (default: "medium")
+# PROXY_THINKING: "disabled" | "enabled" (default: "disabled")
+# PROXY_EFFORT: "low" | "medium" | "high" (default: "low")
 _PROXY_THINKING = os.environ.get("PROXY_THINKING", "disabled")
 _PROXY_EFFORT = os.environ.get("PROXY_EFFORT", "low")
 
@@ -86,8 +86,8 @@ def _is_classifier(body: dict) -> bool:
     """Return True if *body* is an auto-mode safety classifier request.
 
     Uses two independent signals that must both match:
-    1. Structural — non-streaming, no tools, exactly one message
-       (the battle-tested heuristic from deepseek-claude-proxy)
+    1. Structural — non-streaming, no tools, ≤2 messages
+       (transcript + optional assistant pre-fill since v2.1.160)
     2. Content — system prompt opens with the classifier's distinctive
        signature (unique to the ~350-line security policy)
     """
@@ -117,8 +117,7 @@ def _patch_classifier(body: dict) -> dict:
     """Configure thinking and effort for classifier requests.
 
     Controlled by env vars PROXY_THINKING and PROXY_EFFORT.
-    Default: thinking=enabled + effort=medium.
-    Set PROXY_THINKING=disabled to fully disable thinking.
+    Default: thinking=disabled + effort=low.
     """
     body["thinking"] = {"type": _PROXY_THINKING}
     body["output_config"] = {"effort": _PROXY_EFFORT}
