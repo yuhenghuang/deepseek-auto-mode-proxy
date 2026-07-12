@@ -50,7 +50,7 @@ Classifier requests are identified by 4 criteria (all must match):
 
 1. `stream` is not `true` — classifier is non-streaming
 2. `tools` is absent/empty — no tool definitions
-3. `messages` has exactly 1 entry — single transcript message
+3. `messages` has ≤2 entries — transcript + optional assistant pre-fill; real conversations have dozens to hundreds
 4. System prompt starts with `"You are a security monitor for autonomous AI coding agents."` — verified on Claude Code v2.1.205 (Jul 2026). **This signature may change in future versions.**
 
 Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds content-level certainty. False positives are impossible in practice.

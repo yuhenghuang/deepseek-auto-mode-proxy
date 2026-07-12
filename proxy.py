@@ -14,7 +14,7 @@ only effective lever is ``thinking: { type: "disabled" }``.
 **Detection (4 criteria, all must match):**
 1. ``stream`` is not ``true`` — classifier is non-streaming
 2. ``tools`` is absent/empty — classifier has no tool definitions
-3. ``messages`` has exactly 1 entry — single transcript message
+3. ``messages`` has ≤2 entries — transcript + optional assistant pre-fill; regular conversations have dozens
 4. System prompt starts with the classifier's distinctive signature
 
 **Patching:** Injects ``thinking`` and ``output_config`` (controlled by env vars
@@ -95,7 +95,9 @@ def _is_classifier(body: dict) -> bool:
         return False
     if body.get("tools"):
         return False
-    if len(body.get("messages", [])) != 1:
+    # Classifier has 1-2 messages (transcript + optional assistant pre-fill
+    # to force <block> output).  Real conversations have dozens to hundreds.
+    if len(body.get("messages", [])) > 2:
         return False
 
     # Content check — system prompt fingerprint
@@ -139,6 +141,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     upstream_port: int = 443
     upstream_base_path: str = ""
     upstream_use_tls: bool = True
+    verbose: bool = False
 
     # ---------- HTTP methods -------------------------------------------------
 
@@ -156,12 +159,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             else:
                 # Check: structural criteria match but signature failed?
                 # This may indicate a Claude Code update changed the prompt.
-                if not data.get("stream") and not data.get("tools") and len(data.get("messages", [])) == 1:
+                if not data.get("stream") and not data.get("tools") and len(data.get("messages", [])) <= 2:
                     log.warning(
                         "[structural match — possible prompt change] "
                         "classifier signature not detected, request passed through unpatched"
                     )
-                log.info("[pass] %s", self.path)
+                if self.verbose:
+                    log.info("[pass] stream=%s tools=%d msgs=%d sys=%s %s",
+                             bool(data.get("stream")),
+                             len(data.get("tools", [])),
+                             len(data.get("messages", [])),
+                             "yes" if data.get("system") else "no",
+                             self.path)
+                else:
+                    log.info("[pass] %s", self.path)
         except json.JSONDecodeError:
             log.info("[non-json pass] %s", self.path)
 
@@ -311,6 +322,10 @@ def main() -> None:
         "--stop", action="store_true",
         help="Stop any running proxy on the given port and exit",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Log request structure details for debugging",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -318,6 +333,9 @@ def main() -> None:
         format="%(asctime)s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Module-level flag so the handler can check it without global lookups
+    ProxyHandler.verbose = args.verbose
 
     if args.stop:
         _stop_existing(args.port)
