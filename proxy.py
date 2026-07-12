@@ -154,9 +154,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             data = json.loads(raw_body)
             if _is_classifier(data):
                 if self.verbose:
-                    log.info("[classifier] re=%s oc=%s → thinking=%s effort=%s %s",
+                    log.info("[classifier] re=%s oc=%s th=%s → thinking=%s effort=%s %s",
                              "yes" if data.get("reasoning_effort") else "no",
                              "yes" if data.get("output_config") else "no",
+                             data.get("thinking", "absent"),
                              _PROXY_THINKING, _PROXY_EFFORT, self.path)
                 else:
                     log.info("[classifier] thinking=%s effort=%s %s", _PROXY_THINKING, _PROXY_EFFORT, self.path)
