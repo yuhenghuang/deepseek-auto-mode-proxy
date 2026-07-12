@@ -51,11 +51,11 @@ Classifier requests are identified by 4 criteria (all must match):
 1. `stream` is not `true` — classifier is non-streaming
 2. `tools` is absent/empty — no tool definitions
 3. `messages` has exactly 1 entry — single transcript message
-4. System prompt starts with `"You are a security monitor for autonomous AI coding agents."` — unique classifier fingerprint
+4. System prompt starts with `"You are a security monitor for autonomous AI coding agents."` — verified on Claude Code v2.1.205 (Jul 2026). **This signature may change in future versions.**
 
 Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds content-level certainty. False positives are impossible in practice.
 
-> **Note:** Criterion 4 depends on the classifier's system prompt signature. If Anthropic changes this prompt in a future Claude Code release, the proxy will silently stop patching classifier requests. After upgrading Claude Code, verify the proxy log still shows `[classifier]` entries. If structural criteria (1–3) match but the signature doesn't, the proxy logs `[structural match — possible prompt change]` as a warning.
+> **Warning:** Criterion 4 is version-dependent. If Anthropic changes the classifier system prompt in a future Claude Code release, detection will silently stop working — the proxy will pass classifier requests through unpatched, and timeouts will resume. After upgrading Claude Code, check the proxy log for `[classifier]` entries. If missing, update `_CLASSIFIER_SIGNATURE` in proxy.py to match the new prompt opening.
 
 ## Health check
 

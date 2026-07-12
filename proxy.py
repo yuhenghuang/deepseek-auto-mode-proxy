@@ -66,9 +66,10 @@ _HOP_BY_HOP = frozenset({
 })
 
 
-# The classifier system prompt always opens with this exact sentence.
-# Using it as a fingerprint is far more reliable than structural heuristics
-# (message count, stream flag, tools) which could match edge cases.
+# The classifier system prompt always opens with this sentence.
+# Verified on Claude Code v2.1.205 (Jul 2026).
+# WARNING: may change in future versions — if detection stops working,
+# update this string to match the new prompt opening.
 _CLASSIFIER_SIGNATURE = (
     "You are a security monitor for autonomous AI coding agents."
 )
