@@ -57,6 +57,10 @@ Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](http
 
 > **Warning:** Criterion 4 is version-dependent. If Anthropic changes the classifier system prompt in a future Claude Code release, detection will silently stop working — the proxy will pass classifier requests through unpatched, and timeouts will resume. After upgrading Claude Code, check the proxy log for `[classifier]` entries. If missing, update `_CLASSIFIER_SIGNATURE` in proxy.py to match the new prompt opening.
 
+## How patching works
+
+Claude Code v2.1.160+ already sets `reasoning_effort` on classifier requests to reduce thinking time, but DeepSeek's API appears to ignore it (observed via benchmarking, not documented by DeepSeek). The proxy strips `reasoning_effort` and replaces it with two parameters DeepSeek does respect: `thinking` (binary on/off) and `output_config.effort` (output generation effort).
+
 ## Health check
 
 ```bash
