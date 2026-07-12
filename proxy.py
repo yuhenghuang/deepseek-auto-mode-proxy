@@ -27,8 +27,8 @@ Usage::
 
 Environment::
 
-    PROXY_THINKING=disabled|enabled  (default: enabled)
-    PROXY_EFFORT=low|medium|high     (default: medium)
+    PROXY_THINKING=disabled|enabled  (default: disabled)
+    PROXY_EFFORT=low|medium|high     (default: low)
 
 Then configure Claude Code::
 
@@ -51,6 +51,7 @@ import os
 import signal
 import ssl
 import sys
+import time
 from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
@@ -77,8 +78,8 @@ _CLASSIFIER_SIGNATURE = (
 # Default patching behaviour — can be overridden via env vars.
 # PROXY_THINKING: "disabled" | "enabled" (default: "enabled")
 # PROXY_EFFORT: "low" | "medium" | "high" (default: "medium")
-_PROXY_THINKING = os.environ.get("PROXY_THINKING", "enabled")
-_PROXY_EFFORT = os.environ.get("PROXY_EFFORT", "medium")
+_PROXY_THINKING = os.environ.get("PROXY_THINKING", "disabled")
+_PROXY_EFFORT = os.environ.get("PROXY_EFFORT", "low")
 
 
 def _is_classifier(body: dict) -> bool:
@@ -153,16 +154,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             data = json.loads(raw_body)
             if _is_classifier(data):
-                if self.verbose:
-                    log.info("[classifier] re=%s oc=%s th=%s → thinking=%s effort=%s %s",
-                             "yes" if data.get("reasoning_effort") else "no",
-                             "yes" if data.get("output_config") else "no",
-                             data.get("thinking", "absent"),
-                             _PROXY_THINKING, _PROXY_EFFORT, self.path)
-                else:
-                    log.info("[classifier] thinking=%s effort=%s %s", _PROXY_THINKING, _PROXY_EFFORT, self.path)
+                # Capture original values before patching
+                orig_th = data.get("thinking", "absent")
+                orig_re = "yes" if data.get("reasoning_effort") else "no"
+                orig_oc = "yes" if data.get("output_config") else "no"
+                orig_mt = data.get("max_tokens", "?")
                 data = _patch_classifier(data)
                 raw_body = json.dumps(data).encode("utf-8")
+                t0 = time.monotonic()
+                self._forward("POST", raw_body)
+                elapsed = time.monotonic() - t0
+                if self.verbose:
+                    log.info("[classifier] %.1fs re=%s oc=%s th=%s max_tok=%s → thinking=%s effort=%s %s",
+                             elapsed, orig_re, orig_oc, orig_th, orig_mt,
+                             _PROXY_THINKING, _PROXY_EFFORT, self.path)
+                else:
+                    log.info("[classifier] %.1fs thinking=%s effort=%s %s",
+                             elapsed, _PROXY_THINKING, _PROXY_EFFORT, self.path)
+                return
             else:
                 # Check: structural criteria match but signature failed?
                 # This may indicate a Claude Code update changed the prompt.
