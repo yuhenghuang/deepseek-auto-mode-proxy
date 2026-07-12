@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+nohup.out
+.venv/
+.env
+.DS_Store
+archive/
+DESIGN.md
