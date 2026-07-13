@@ -48,16 +48,21 @@ import http.server
 import json
 import logging
 import os
+import platform
+import re
 import signal
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
-PID_FILE = "/tmp/deepseek-proxy.pid"
+PID_FILE = os.path.join(tempfile.gettempdir(), "deepseek-proxy.pid")
+_IS_WINDOWS = platform.system() == "Windows"
 
 # Hop-by-hop headers — must not be forwarded in either direction (RFC 2616 §13.5.1)
 _HOP_BY_HOP = frozenset({
@@ -289,13 +294,55 @@ class _ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _kill_process(pid: int) -> None:
+    """Terminate a process by PID, cross-platform."""
+    if _IS_WINDOWS:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            capture_output=True,
+        )
+    else:
+        os.kill(pid, signal.SIGTERM)
+
+
+def _find_pid_by_port(port: int) -> int | None:
+    """Return the PID of the process listening on *port*, or None."""
+    if _IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    # netstat -ano columns: Proto  Local Address  Foreign  State  PID
+                    parts = line.split()
+                    return int(parts[-1])
+            return None
+        except Exception:
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                ["ss", "-tlnp"], capture_output=True, text=True
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line:
+                    # ss -tlnp output: ... users:(("proc",pid=1234,fd=3))
+                    m = re.search(r"pid=(\d+)", line)
+                    if m:
+                        return int(m.group(1))
+            return None
+        except Exception:
+            return None
+
+
 def _stop_existing(port: int) -> None:
     """Stop a running proxy instance on *port* by PID file or port match."""
     # Try PID file first
     try:
         with open(PID_FILE) as f:
             pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
+        _kill_process(pid)
         log.info("Stopped proxy (PID %d from %s)", pid, PID_FILE)
         os.remove(PID_FILE)
         return
@@ -303,24 +350,13 @@ def _stop_existing(port: int) -> None:
         pass
 
     # Fallback: find by port
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["ss", "-tlnp"], capture_output=True, text=True
-        )
-        for line in result.stdout.splitlines():
-            if f":{port}" in line:
-                # Extract PID from ss output: pid=12345
-                for part in line.split():
-                    if part.startswith("pid="):
-                        pid = int(part.split("=")[1].rstrip(","))
-                        os.kill(pid, signal.SIGTERM)
-                        log.info("Stopped proxy (PID %d bound to port %d)", pid, port)
-                        return
-        log.warning("No running proxy found on port %d", port)
-    except Exception as exc:
-        log.error("Failed to stop existing proxy: %s", exc)
-        raise SystemExit(1)
+    pid = _find_pid_by_port(port)
+    if pid is not None:
+        _kill_process(pid)
+        log.info("Stopped proxy (PID %d bound to port %d)", pid, port)
+        return
+
+    log.warning("No running proxy found on port %d", port)
 
 
 def main() -> None:

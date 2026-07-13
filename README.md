@@ -77,7 +77,9 @@ curl http://127.0.0.1:8799/health
 
 ## Requirements
 
-Python 3.7+. Zero dependencies (stdlib only).
+Python 3.7+. Zero dependencies (stdlib only). Works on Linux, macOS, and Windows.
+
+On Windows, use `python proxy.py` instead of `python3`.
 
 ## Related
 
