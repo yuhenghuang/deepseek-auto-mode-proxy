@@ -46,10 +46,12 @@ python3 proxy.py --stop
 | ---------------- | ----------------------- | ------------------------------------ |
 | `PROXY_THINKING` | `disabled`, `enabled`   | `disabled`                          |
 | `PROXY_EFFORT`   | `low`, `medium`, `high` | `low`                               |
+| `PROXY_PID_FILE` | any path                | `<tempdir>/deepseek-proxy.pid`      |
 | `--port`         | any port                | `8799`                               |
 | `--upstream`     | any URL                 | `https://api.deepseek.com/anthropic` |
 | `--stop`         | —                       | Stop running instance and exit       |
 | `-v`, `--verbose` | —                     | Log request details for debugging    |
+| `--version`      | —                       | Print version and exit               |
 
 ## How detection works
 
@@ -74,6 +76,16 @@ Claude Code v2.1.205 sends classifier requests with `max_tokens=2112` and no `th
 curl http://127.0.0.1:8799/health
 # {"ok": true}
 ```
+
+## Testing
+
+The repo ships an offline test suite (stdlib `unittest` only — no dependencies, no network):
+
+```bash
+python3 -m unittest test_proxy -v
+```
+
+It covers classifier detection (all 4 criteria), patching, byte-identical passthrough, SSE streaming, health/error responses, and `--stop`/SIGTERM process handling. Tests use ephemeral ports and their own PID file, so they never touch a running proxy.
 
 ## Requirements
 
