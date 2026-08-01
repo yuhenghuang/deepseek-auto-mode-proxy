@@ -82,7 +82,7 @@ curl http://127.0.0.1:8799/health
 The repo ships an offline test suite (stdlib `unittest` only — no dependencies, no network):
 
 ```bash
-python3 -m unittest test_proxy -v
+python3 -m unittest discover -s tests -v
 ```
 
 It covers classifier detection (all 4 criteria), patching, byte-identical passthrough, SSE streaming, health/error responses, and `--stop`/SIGTERM process handling. Tests use ephemeral ports and their own PID file, so they never touch a running proxy.

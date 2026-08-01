@@ -5,9 +5,9 @@ Stdlib ``unittest`` only — no pytest, no requests. The suite never touches
 the live PID file (``proxy.PID_FILE`` is repointed to a temp path) and never
 hits the real DeepSeek API (a local fake upstream stands in).
 
-Run with::
+Run from the repo root with::
 
-    python3 -m unittest test_proxy -v
+    python3 -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
@@ -26,10 +26,11 @@ import threading
 import time
 import unittest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 import proxy  # noqa: E402
 
-_PROXY_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxy.py")
+_PROXY_PY = os.path.join(_REPO_ROOT, "proxy.py")
 _TMPDIR = tempfile.mkdtemp(prefix="deepseek-proxy-test-")
 
 _CLASSIFIER = proxy._CLASSIFIER_SIGNATURE
