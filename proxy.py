@@ -127,7 +127,7 @@ def _structural_match(body: dict) -> bool:
 
 def _system_texts(body: dict) -> list[str]:
     """Return all supported text entries from the system prompt."""
-    system = body.get("system", "")
+    system = body.get("system")
     if isinstance(system, str):
         return [system]
     if not isinstance(system, list):

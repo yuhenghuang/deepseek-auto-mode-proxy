@@ -218,6 +218,12 @@ class TestClassifierDetection(unittest.TestCase):
     def test_no_system(self):
         self.assertFalse(proxy._is_classifier(_classifier_body(system="")))
 
+    def test_missing_system_has_no_text_blocks(self):
+        body = _classifier_body()
+        del body["system"]
+        self.assertEqual(proxy._system_texts(body), [])
+        self.assertFalse(proxy._is_classifier(body))
+
     def test_non_dict_input(self):
         for bad in ([1, 2, 3], "text", None, 42):
             self.assertFalse(proxy._is_classifier(bad))
@@ -328,6 +334,24 @@ class TestProxyPassthrough(ProxyTestCase):
         self.assertIn("container=list text_blocks=2", output)
         self.assertIn("changed classifier opening", output)
         self.assertNotIn("short metadata", output)
+
+    def test_verbose_diagnostic_reports_zero_blocks_without_system(self):
+        body = json.dumps({
+            "stream": False,
+            "messages": [{"role": "user", "content": "transcript"}],
+        }).encode()
+        old_verbose = proxy.ProxyHandler.verbose
+        proxy.ProxyHandler.verbose = True
+        try:
+            with self.assertLogs("deepseek-proxy", level="WARNING") as captured:
+                status, _, _ = self.post(body)
+        finally:
+            proxy.ProxyHandler.verbose = old_verbose
+
+        output = "\n".join(captured.output)
+        self.assertEqual(status, 200)
+        self.assertIn("container=NoneType text_blocks=0", output)
+        self.assertIn("longest_prefix=''", output)
 
     def test_nonverbose_structural_mismatch_does_not_log_system_prefix(self):
         body = json.dumps({
