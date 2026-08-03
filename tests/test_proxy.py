@@ -184,11 +184,34 @@ class TestClassifierDetection(unittest.TestCase):
         system = [{"type": "text", "text": _CLASSIFIER + " policy"}]
         self.assertTrue(proxy._is_classifier(_classifier_body(system=system)))
 
-    def test_signature_not_first_position(self):
-        # Signature must open the FIRST block — later blocks don't count.
+    def test_signature_after_arbitrary_metadata_blocks_detected(self):
         system = [
-            {"type": "text", "text": "Something else entirely"},
+            {"type": "text", "text": "future-metadata: one"},
+            {"type": "metadata", "value": {"future": True}},
+            {"type": "text", "text": "future-metadata: two"},
+            {"type": "text", "text": _CLASSIFIER + " policy"},
+        ]
+        self.assertTrue(proxy._is_classifier(_classifier_body(system=system)))
+
+    def test_signature_before_arbitrary_metadata_detected(self):
+        system = [
             {"type": "text", "text": _CLASSIFIER},
+            {"type": "text", "text": "future-metadata: trailing"},
+        ]
+        self.assertTrue(proxy._is_classifier(_classifier_body(system=system)))
+
+    def test_signature_in_middle_of_block_not_detected(self):
+        system = [
+            {"type": "text", "text": "prefix " + _CLASSIFIER},
+        ]
+        self.assertFalse(proxy._is_classifier(_classifier_body(system=system)))
+
+    def test_malformed_system_blocks_ignored(self):
+        system = [
+            None,
+            "plain list item",
+            {"type": "text"},
+            {"type": "text", "text": 42},
         ]
         self.assertFalse(proxy._is_classifier(_classifier_body(system=system)))
 
@@ -241,6 +264,18 @@ class TestProxyPassthrough(ProxyTestCase):
         _, _, _, up_body = _FakeUpstreamHandler.requests[0]
         self.assertEqual(up_body, body)  # byte-identical to what the client sent
 
+    def test_unmatched_classifier_candidate_is_byte_identical(self):
+        body = json.dumps(_classifier_body(
+            system=[
+                {"type": "text", "text": "future-metadata"},
+                {"type": "text", "text": "Changed classifier opening"},
+            ]
+        )).encode()
+        with self.assertLogs("deepseek-proxy", level="WARNING"):
+            status, _, _ = self.post(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(_FakeUpstreamHandler.requests[0][3], body)
+
     def test_non_object_body_passthrough(self):
         body = b"[1, 2, 3]"  # valid JSON, but not a dict — must not crash
         status, _, _ = self.post(body)
@@ -250,6 +285,68 @@ class TestProxyPassthrough(ProxyTestCase):
     def test_empty_body_post(self):
         status, _, _ = self.post(b"")
         self.assertEqual(status, 200)
+
+    def test_verbose_structural_mismatch_logs_bounded_system_prefix(self):
+        prefix = "Changed classifier opening: " + "x" * 150
+        secret_tail = "MUST_NOT_APPEAR_IN_LOG"
+        body = json.dumps({
+            "stream": False,
+            "messages": [{"role": "user", "content": "transcript"}],
+            "system": prefix + secret_tail,
+        }).encode()
+        old_verbose = proxy.ProxyHandler.verbose
+        proxy.ProxyHandler.verbose = True
+        try:
+            with self.assertLogs("deepseek-proxy", level="WARNING") as captured:
+                status, _, _ = self.post(body)
+        finally:
+            proxy.ProxyHandler.verbose = old_verbose
+
+        output = "\n".join(captured.output)
+        self.assertEqual(status, 200)
+        self.assertIn("[candidate system] container=str text_blocks=1", output)
+        self.assertIn(prefix[:proxy._DEBUG_SYSTEM_PREFIX_CHARS], output)
+        self.assertNotIn(secret_tail, output)
+
+    def test_verbose_diagnostic_uses_longest_text_block(self):
+        system = [
+            {"type": "text", "text": "short metadata"},
+            {"type": "metadata", "value": "ignored"},
+            {"type": "text", "text": "changed classifier opening " + "x" * 130},
+        ]
+        body = json.dumps(_classifier_body(system=system)).encode()
+        old_verbose = proxy.ProxyHandler.verbose
+        proxy.ProxyHandler.verbose = True
+        try:
+            with self.assertLogs("deepseek-proxy", level="WARNING") as captured:
+                status, _, _ = self.post(body)
+        finally:
+            proxy.ProxyHandler.verbose = old_verbose
+
+        output = "\n".join(captured.output)
+        self.assertEqual(status, 200)
+        self.assertIn("container=list text_blocks=2", output)
+        self.assertIn("changed classifier opening", output)
+        self.assertNotIn("short metadata", output)
+
+    def test_nonverbose_structural_mismatch_does_not_log_system_prefix(self):
+        body = json.dumps({
+            "stream": False,
+            "messages": [{"role": "user", "content": "transcript"}],
+            "system": "Changed classifier opening",
+        }).encode()
+        old_verbose = proxy.ProxyHandler.verbose
+        proxy.ProxyHandler.verbose = False
+        try:
+            with self.assertLogs("deepseek-proxy", level="WARNING") as captured:
+                status, _, _ = self.post(body)
+        finally:
+            proxy.ProxyHandler.verbose = old_verbose
+
+        output = "\n".join(captured.output)
+        self.assertEqual(status, 200)
+        self.assertIn("possible prompt change", output)
+        self.assertNotIn("[candidate system]", output)
 
     def test_streaming_sse_passthrough(self):
         _FakeUpstreamHandler.response_headers = [("Content-Type", "text/event-stream")]
@@ -318,6 +415,27 @@ class TestClassifierThroughProxy(ProxyTestCase):
         # Unrelated fields must survive the patch untouched.
         self.assertEqual(parsed["max_tokens"], 2112)
         self.assertEqual(parsed["system"], _CLASSIFIER + " 350 lines of security policy...")
+
+    def test_metadata_prefixed_classifier_is_patched(self):
+        system = [
+            {
+                "type": "text",
+                "text": (
+                    "x-anthropic-billing-header: "
+                    "cc_version=2.1.212.d6e; cc_entrypoint=cli;"
+                ),
+            },
+            {"type": "text", "text": "future-metadata: arbitrary"},
+            {"type": "text", "text": _CLASSIFIER + " policy"},
+        ]
+        body = json.dumps(_classifier_body(system=system)).encode()
+        status, _, _ = self.post(body)
+        self.assertEqual(status, 200)
+
+        _, _, _, up_body = _FakeUpstreamHandler.requests[0]
+        parsed = json.loads(up_body)
+        self.assertEqual(parsed["thinking"], {"type": "disabled"})
+        self.assertEqual(parsed["output_config"], {"effort": "low"})
 
 
 # ---------------------------------------------------------------------------
