@@ -15,7 +15,7 @@ only effective lever is ``thinking: { type: "disabled" }``.
 1. ``stream`` is not ``true`` — classifier is non-streaming
 2. ``tools`` is absent/empty — classifier has no tool definitions
 3. ``messages`` has ≤2 entries — transcript + optional assistant pre-fill; regular conversations have dozens
-4. System prompt starts with the classifier's distinctive signature
+4. One system text block starts with the classifier's distinctive signature
 
 **Patching:** Injects ``thinking`` and ``output_config`` (controlled by env vars
 PROXY_THINKING and PROXY_EFFORT). Strips ``reasoning_effort`` for compatibility.
@@ -64,7 +64,7 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
 DEFAULT_PORT = 8799
@@ -89,10 +89,11 @@ _SKIP_RESPONSE_HEADERS = frozenset({"server", "date"})
 
 _VALID_THINKING = frozenset({"disabled", "enabled"})
 _VALID_EFFORT = frozenset({"low", "medium", "high"})
+_DEBUG_SYSTEM_PREFIX_CHARS = 120
 
 
 # The classifier system prompt always opens with this sentence.
-# Verified on Claude Code v2.1.205 (Jul 2026).
+# Signature and multi-block wire layout verified on Claude Code v2.1.212.
 # WARNING: may change in future versions — if detection stops working,
 # update this string to match the new prompt opening.
 _CLASSIFIER_SIGNATURE = (
@@ -124,18 +125,25 @@ def _structural_match(body: dict) -> bool:
     return len(body.get("messages", [])) <= 2
 
 
-def _signature_match(body: dict) -> bool:
-    """Criterion 4: system prompt opens with the classifier's signature."""
-    system = body.get("system", "")
+def _system_texts(body: dict) -> list[str]:
+    """Return all supported text entries from the system prompt."""
+    system = body.get("system")
     if isinstance(system, str):
-        return system.startswith(_CLASSIFIER_SIGNATURE)
-    if isinstance(system, list) and len(system) > 0:
-        first = system[0]
-        if isinstance(first, dict):
-            text = first.get("text", "")
-            if isinstance(text, str):
-                return text.startswith(_CLASSIFIER_SIGNATURE)
-    return False
+        return [system]
+    if not isinstance(system, list):
+        return []
+    return [
+        block["text"]
+        for block in system
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+
+
+def _signature_match(body: dict) -> bool:
+    """Criterion 4: a system text block opens with the exact signature."""
+    return any(
+        text.startswith(_CLASSIFIER_SIGNATURE) for text in _system_texts(body)
+    )
 
 
 def _is_classifier(body) -> bool:
@@ -144,8 +152,8 @@ def _is_classifier(body) -> bool:
     Uses two independent signals that must both match:
     1. Structural — non-streaming, no tools, ≤2 messages
        (transcript + optional assistant pre-fill since v2.1.160)
-    2. Content — system prompt opens with the classifier's distinctive
-       signature (unique to the ~350-line security policy)
+    2. Content — a system text block opens with the classifier's distinctive
+       signature; unrelated metadata blocks may appear before or after it
     """
     if not isinstance(body, dict):
         return False
@@ -241,6 +249,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         # Structural criteria matched but the signature didn't?
         # This may indicate a Claude Code update changed the prompt.
         if _structural_match(data):
+            if self.verbose:
+                system = data.get("system")
+                texts = _system_texts(data)
+                longest = max(texts, key=len, default="")
+                log.warning(
+                    "[candidate system] container=%s text_blocks=%d "
+                    "longest_prefix=%r",
+                    type(system).__name__,
+                    len(texts),
+                    longest[:_DEBUG_SYSTEM_PREFIX_CHARS],
+                )
             log.warning(
                 "[structural match — possible prompt change] "
                 "classifier signature not detected, request passed through unpatched"

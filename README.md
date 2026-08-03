@@ -50,7 +50,7 @@ python3 proxy.py --stop
 | `--port`         | any port                | `8799`                               |
 | `--upstream`     | any URL                 | `https://api.deepseek.com/anthropic` |
 | `--stop`         | —                       | Stop running instance and exit       |
-| `-v`, `--verbose` | —                     | Log request details for debugging    |
+| `-v`, `--verbose` | —                     | Log request details for debugging; unmatched classifier-shaped requests include at most 120 system-prompt characters |
 | `--version`      | —                       | Print version and exit               |
 
 ## How detection works
@@ -60,11 +60,17 @@ Classifier requests are identified by 4 criteria (all must match):
 1. `stream` is not `true` — classifier is non-streaming
 2. `tools` is absent/empty — no tool definitions
 3. `messages` has ≤2 entries — v2.1.160 (Jun 2025) added an assistant pre-fill to force `<block>` output, increasing the count from 1 to 2; real conversations have dozens to hundreds
-4. System prompt starts with `"You are a security monitor for autonomous AI coding agents."` — verified on Claude Code v2.1.205. **This signature may change in future versions.**
+4. A system text block starts with `"You are a security monitor for autonomous AI coding agents."`. The proxy checks every text block, so metadata blocks may appear before or after the classifier prompt. This accommodates the `x-anthropic-billing-header:` block observed in Claude Code v2.1.212 and future metadata layouts without depending on their names or positions. **The signature itself may change in future versions.**
 
-Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds content-level certainty. False positives are impossible in practice.
+Criteria 1–3 are the battle-tested heuristic from [deepseek-claude-proxy](https://github.com/dashxio/deepseek-claude-proxy). Criterion 4 adds a strong content-level check. Matching only at the start of a text block avoids treating incidental mentions of the sentence as classifier prompts.
 
-> **Warning:** Criterion 4 is version-dependent. If Anthropic changes the classifier system prompt in a future Claude Code release, detection will silently stop working — the proxy will pass classifier requests through unpatched, and timeouts will resume. After upgrading Claude Code, check the proxy log for `[classifier]` entries. If missing, update `_CLASSIFIER_SIGNATURE` in proxy.py to match the new prompt opening.
+> **Warning:** Criterion 4 is version-dependent. If Anthropic changes the classifier system prompt opening in a future Claude Code release, detection will stop working — the proxy will safely pass classifier requests through unpatched, and timeouts may resume. After upgrading Claude Code, check the proxy log for `[classifier]` entries. If missing, inspect the bounded `-v` diagnostic and update `_CLASSIFIER_SIGNATURE` in proxy.py.
+
+Run with `-v` to diagnose a possible prompt change. For a request that matches
+the structural criteria but not the signature, verbose mode logs the system
+container type, text-block count, and only the first 120 characters of the
+longest text block. Normal mode never logs system-prompt text. Treat verbose
+logs as potentially sensitive and disable them after debugging.
 
 ## How patching works
 
