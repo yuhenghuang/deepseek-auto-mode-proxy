@@ -53,7 +53,7 @@ python3 proxy.py --stop
 | `-v`, `--verbose` | —                     | Log request details for debugging    |
 | `--version`      | —                       | Print version and exit               |
 
-`PROXY_EFFORT` accepts DeepSeek's documented values (`low`, `high`, `max`). On DeepSeek V4 Pro only **two tiers are distinct today**: `high` (the default) and `max` — `low` maps to `high` and `xhigh` to `max`; `medium` is not a DeepSeek value. The docs note the V4 Pro mapping is due for an update in early August 2026 — a third tier may land soon. Source: [DeepSeek Thinking Mode docs](https://api-docs.deepseek.com/guides/thinking_mode).
+`PROXY_EFFORT` accepts DeepSeek's documented values (`low`, `high`, `max`). On DeepSeek V4 Pro only **two tiers are distinct today**: `high` (the default) and `max` — `low` maps to `high` and `xhigh` to `max`; `medium` is not a DeepSeek value. The docs flag the V4 Pro mapping as provisional — a third tier may land later; `low` is accepted either way. Source: [DeepSeek Thinking Mode docs](https://api-docs.deepseek.com/guides/thinking_mode).
 
 ## How detection works
 
