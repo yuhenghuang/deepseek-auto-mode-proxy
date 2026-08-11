@@ -18,7 +18,7 @@ Only classifier requests are patched. All other traffic passes through unchanged
 
 ### Why not just lower the thinking budget?
 
-DeepSeek's Claude-compatible API **ignores** `budget_tokens`. The thinking mode is binary: `"disabled"` or full. `output_config.effort` controls output generation but doesn't constrain the thinking phase. A local proxy is the minimum viable interception point.
+DeepSeek's Claude-compatible API **ignores** `budget_tokens`, and thinking effort has only **two distinct tiers on V4 Pro** (`high` — the default — and `max`; `low` and `xhigh` are silently aliased, `medium` isn't a value at all). There is no "brief thinking" tier to request — thinking is either `disabled` or full-effort. A local proxy is the minimum viable interception point.
 
 ## Quick start
 
@@ -45,13 +45,15 @@ python3 proxy.py --stop
 | Variable / flag  | Values                  | Default                              |
 | ---------------- | ----------------------- | ------------------------------------ |
 | `PROXY_THINKING` | `disabled`, `enabled`   | `disabled`                          |
-| `PROXY_EFFORT`   | `low`, `medium`, `high` | `low`                               |
+| `PROXY_EFFORT`   | `low`, `high`, `max`    | `high`                              |
 | `PROXY_PID_FILE` | any path                | `<tempdir>/deepseek-proxy.pid`      |
 | `--port`         | any port                | `8799`                               |
 | `--upstream`     | any URL                 | `https://api.deepseek.com/anthropic` |
 | `--stop`         | —                       | Stop running instance and exit       |
 | `-v`, `--verbose` | —                     | Log request details for debugging    |
 | `--version`      | —                       | Print version and exit               |
+
+`PROXY_EFFORT` accepts DeepSeek's documented values (`low`, `high`, `max`). On DeepSeek V4 Pro only **two tiers are distinct today**: `high` (the default) and `max` — `low` maps to `high` and `xhigh` to `max`; `medium` is not a DeepSeek value. The docs note the V4 Pro mapping is due for an update in early August 2026 — a third tier may land soon. Source: [DeepSeek Thinking Mode docs](https://api-docs.deepseek.com/guides/thinking_mode).
 
 ## How detection works
 

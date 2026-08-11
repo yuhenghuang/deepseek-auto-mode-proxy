@@ -204,7 +204,7 @@ class TestPatchClassifier(unittest.TestCase):
     def test_defaults(self):
         out = proxy._patch_classifier({"messages": []})
         self.assertEqual(out["thinking"], {"type": "disabled"})
-        self.assertEqual(out["output_config"], {"effort": "low"})
+        self.assertEqual(out["output_config"], {"effort": "high"})
 
     def test_custom_thinking_and_effort(self):
         out = proxy._patch_classifier(
@@ -212,6 +212,11 @@ class TestPatchClassifier(unittest.TestCase):
         )
         self.assertEqual(out["thinking"], {"type": "enabled"})
         self.assertEqual(out["output_config"], {"effort": "high"})
+
+    def test_max_effort(self):
+        # "max" is the second distinct tier on deepseek-v4-pro (v1.2.0).
+        out = proxy._patch_classifier({"messages": []}, effort="max")
+        self.assertEqual(out["output_config"], {"effort": "max"})
 
     def test_strips_reasoning_effort(self):
         out = proxy._patch_classifier({"messages": [], "reasoning_effort": "high"})
@@ -313,11 +318,45 @@ class TestClassifierThroughProxy(ProxyTestCase):
         _, _, _, up_body = _FakeUpstreamHandler.requests[0]
         parsed = json.loads(up_body)
         self.assertEqual(parsed["thinking"], {"type": "disabled"})
-        self.assertEqual(parsed["output_config"], {"effort": "low"})
+        self.assertEqual(parsed["output_config"], {"effort": "high"})
         self.assertNotIn("reasoning_effort", parsed)
         # Unrelated fields must survive the patch untouched.
         self.assertEqual(parsed["max_tokens"], 2112)
         self.assertEqual(parsed["system"], _CLASSIFIER + " 350 lines of security policy...")
+
+
+class TestEnvValidation(unittest.TestCase):
+    """PROXY_EFFORT validation: only DeepSeek's real values are accepted."""
+
+    def setUp(self):
+        self._saved = os.environ.get("PROXY_EFFORT")
+
+        def _restore():
+            if self._saved is None:
+                os.environ.pop("PROXY_EFFORT", None)
+            else:
+                os.environ["PROXY_EFFORT"] = self._saved
+
+        self.addCleanup(_restore)
+
+    def test_effort_max_accepted(self):
+        os.environ["PROXY_EFFORT"] = "max"
+        self.assertEqual(
+            proxy._env_value("PROXY_EFFORT", "high", proxy._VALID_EFFORT), "max"
+        )
+
+    def test_effort_low_accepted(self):
+        os.environ["PROXY_EFFORT"] = "low"
+        self.assertEqual(
+            proxy._env_value("PROXY_EFFORT", "high", proxy._VALID_EFFORT), "low"
+        )
+
+    def test_effort_medium_rejected(self):
+        # "medium" is not a DeepSeek value — must fall back to the default.
+        os.environ["PROXY_EFFORT"] = "medium"
+        self.assertEqual(
+            proxy._env_value("PROXY_EFFORT", "high", proxy._VALID_EFFORT), "high"
+        )
 
 
 # ---------------------------------------------------------------------------

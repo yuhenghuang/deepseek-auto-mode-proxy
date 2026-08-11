@@ -8,8 +8,9 @@ when DeepSeek V4 Pro's thinking mode is enabled, hitting the internal timeout.
 classifier receives a ~350-line security policy as system prompt plus a ~200K-char
 transcript as the user message. With thinking enabled and a high max_tokens, the
 model generates thousands of thinking tokens — taking 28–32s. DeepSeek ignores
-``budget_tokens`` and ``output_config.effort`` doesn't constrain thinking, so the
-only effective lever is ``thinking: { type: "disabled" }``.
+``budget_tokens``, and thinking effort has only two distinct tiers on V4 Pro
+(``high`` — the default — and ``max``; ``low``/``xhigh`` are aliased, ``medium``
+isn't a value), so the only effective lever is ``thinking: { type: "disabled" }``.
 
 **Detection (4 criteria, all must match):**
 1. ``stream`` is not ``true`` — classifier is non-streaming
@@ -28,7 +29,7 @@ Usage::
 Environment::
 
     PROXY_THINKING=disabled|enabled  (default: disabled)
-    PROXY_EFFORT=low|medium|high     (default: low)
+    PROXY_EFFORT=low|high|max       (default: high)
     PROXY_PID_FILE=<path>            (default: tempdir/deepseek-proxy.pid)
 
 Then configure Claude Code::
@@ -40,7 +41,7 @@ ANTHROPIC_BASE_URL must NOT include ``/anthropic``.
 
 Default port is 8799. Override with --port.
 
-Tests: ``python3 -m unittest test_proxy -v`` (offline, stdlib only).
+Tests: ``python3 -m unittest discover -s tests -v`` (offline, stdlib only).
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
 DEFAULT_PORT = 8799
@@ -88,7 +89,11 @@ _HOP_BY_HOP = frozenset({
 _SKIP_RESPONSE_HEADERS = frozenset({"server", "date"})
 
 _VALID_THINKING = frozenset({"disabled", "enabled"})
-_VALID_EFFORT = frozenset({"low", "medium", "high"})
+# Effort values DeepSeek accepts. Only two are distinct on deepseek-v4-pro
+# today: "high" (the default) and "max" — "low" aliases to "high" and "xhigh"
+# to "max"; "medium" is not a DeepSeek value at all.
+# See https://api-docs.deepseek.com/guides/thinking_mode
+_VALID_EFFORT = frozenset({"low", "high", "max"})
 
 
 # The classifier system prompt always opens with this sentence.
@@ -152,11 +157,11 @@ def _is_classifier(body) -> bool:
     return _structural_match(body) and _signature_match(body)
 
 
-def _patch_classifier(body: dict, thinking: str = "disabled", effort: str = "low") -> dict:
+def _patch_classifier(body: dict, thinking: str = "disabled", effort: str = "high") -> dict:
     """Configure thinking and effort for classifier requests.
 
     Controlled by env vars PROXY_THINKING and PROXY_EFFORT.
-    Default: thinking=disabled + effort=low.
+    Default: thinking=disabled + effort=high (DeepSeek's own default).
     """
     body["thinking"] = {"type": thinking}
     body["output_config"] = {"effort": effort}
@@ -188,7 +193,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     verbose: bool = False
     # Classifier patching config, set from env vars in main()
     thinking: str = "disabled"
-    effort: str = "low"
+    effort: str = "high"
 
     # ---------- HTTP methods -------------------------------------------------
 
@@ -581,7 +586,7 @@ def main() -> None:
 
     # Load classifier config from env; warn and keep defaults on bad values.
     ProxyHandler.thinking = _env_value("PROXY_THINKING", "disabled", _VALID_THINKING)
-    ProxyHandler.effort = _env_value("PROXY_EFFORT", "low", _VALID_EFFORT)
+    ProxyHandler.effort = _env_value("PROXY_EFFORT", "high", _VALID_EFFORT)
 
     try:
         server = build_server(args.port, args.upstream, args.verbose)
