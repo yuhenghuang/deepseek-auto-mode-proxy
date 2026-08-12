@@ -18,7 +18,7 @@ Only classifier requests are patched. All other traffic passes through unchanged
 
 ### Why not just lower the thinking budget?
 
-DeepSeek's Claude-compatible API **ignores** `budget_tokens`, and thinking effort has only **two distinct tiers on V4 Pro** (`high` — the default — and `max`; `low` and `xhigh` are silently aliased, `medium` isn't a value at all). There is no "brief thinking" tier to request — thinking is either `disabled` or full-effort. A local proxy is the minimum viable interception point.
+DeepSeek's Claude-compatible API **ignores** `budget_tokens`, and thinking effort has only **three distinct tiers on V4 Pro** (`low`, `high` — the default, and `max`; `medium` and `xhigh` are silently aliased to `high`). The proxy still disables thinking by default because that is the only mode measured at 1–3s on classifier-sized inputs; the new `low` tier is available via `PROXY_EFFORT=low` for anyone who wants to benchmark it. A local proxy is the minimum viable interception point.
 
 ## Quick start
 
@@ -53,7 +53,7 @@ python3 proxy.py --stop
 | `-v`, `--verbose` | —                     | Log request details for debugging    |
 | `--version`      | —                       | Print version and exit               |
 
-`PROXY_EFFORT` accepts DeepSeek's documented values (`low`, `high`, `max`). On DeepSeek V4 Pro only **two tiers are distinct today**: `high` (the default) and `max` — `low` maps to `high` and `xhigh` to `max`; `medium` is not a DeepSeek value. The docs flag the V4 Pro mapping as provisional — a third tier may land later; `low` is accepted either way. Source: [DeepSeek Thinking Mode docs](https://api-docs.deepseek.com/guides/thinking_mode).
+`PROXY_EFFORT` accepts the values DeepSeek's Anthropic-compatible API accepts for `output_config.effort` (`low`, `high`, `max`). Since the August 2026 docs update, all three are distinct tiers on DeepSeek V4 Pro: `low` → low, `high` → high (the default), `max` → max. The docs' requested-level table also lists `medium` and `xhigh`, but both map to `high` and are rejected by `output_config.effort`. Source: [DeepSeek Thinking Mode docs](https://api-docs.deepseek.com/guides/thinking_mode).
 
 ## How detection works
 

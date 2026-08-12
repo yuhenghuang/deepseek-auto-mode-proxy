@@ -8,9 +8,10 @@ when DeepSeek V4 Pro's thinking mode is enabled, hitting the internal timeout.
 classifier receives a ~350-line security policy as system prompt plus a ~200K-char
 transcript as the user message. With thinking enabled and a high max_tokens, the
 model generates thousands of thinking tokens — taking 28–32s. DeepSeek ignores
-``budget_tokens``, and thinking effort has only two distinct tiers on V4 Pro
-(``high`` — the default — and ``max``; ``low``/``xhigh`` are aliased, ``medium``
-isn't a value), so the only effective lever is ``thinking: { type: "disabled" }``.
+``budget_tokens``, and thinking effort has three distinct tiers on V4 Pro since
+the Aug 2026 docs update (``low``, ``high`` — the default — and ``max``;
+``medium``/``xhigh`` alias to ``high``), so the only lever measured to keep
+classifier latency at 1–3s is ``thinking: { type: "disabled" }``.
 
 **Detection (4 criteria, all must match):**
 1. ``stream`` is not ``true`` — classifier is non-streaming
@@ -57,15 +58,15 @@ import re
 import signal
 import ssl
 import subprocess
-import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
 
-__version__ = "1.2.0"
+__version__ = "1.3.1"
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
 DEFAULT_PORT = 8799
@@ -89,10 +90,12 @@ _HOP_BY_HOP = frozenset({
 _SKIP_RESPONSE_HEADERS = frozenset({"server", "date"})
 
 _VALID_THINKING = frozenset({"disabled", "enabled"})
-# Effort values DeepSeek accepts. Only two are distinct on deepseek-v4-pro
-# today: "high" (the default) and "max" — "low" aliases to "high" and "xhigh"
-# to "max"; "medium" is not a DeepSeek value at all.
-# See https://api-docs.deepseek.com/guides/thinking_mode
+# Effort values DeepSeek's Anthropic-compatible API accepts for
+# output_config.effort: "low", "high" (the default), "max". Since the Aug 2026
+# docs update all three are distinct tiers on deepseek-v4-pro ("low" was
+# previously aliased to "high"). The docs' requested-level table also lists
+# "medium" and "xhigh", but both map to "high" and are rejected by this
+# parameter. See https://api-docs.deepseek.com/guides/thinking_mode
 _VALID_EFFORT = frozenset({"low", "high", "max"})
 
 
@@ -177,6 +180,23 @@ def _forward_headers(source, sink_dict: dict[str, str]) -> None:
             sink_dict[key] = value
 
 
+@dataclass(frozen=True)
+class _ProxyConfig:
+    """Immutable per-server configuration, set once by build_server().
+
+    Server-scoped rather than handler-class-scoped so several proxies with
+    different upstreams can run concurrently in one process without stepping
+    on each other's state.
+    """
+    upstream_host: str
+    upstream_port: int
+    upstream_base_path: str
+    upstream_use_tls: bool
+    verbose: bool
+    thinking: str
+    effort: str
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     """Forward Anthropic Messages API requests → DeepSeek, patching classifiers."""
 
@@ -185,31 +205,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # streaming path relies on when Content-Length is unknown. Do not switch
     # to 1.1 without re-testing SSE passthrough.
 
-    # Set once at startup by build_server()
-    upstream_host: str = "api.deepseek.com"
-    upstream_port: int = 443
-    upstream_base_path: str = ""
-    upstream_use_tls: bool = True
-    verbose: bool = False
-    # Classifier patching config, set from env vars in main()
-    thinking: str = "disabled"
-    effort: str = "high"
-
     # ---------- HTTP methods -------------------------------------------------
 
     def do_POST(self) -> None:
         """Forward a POST request, patching classifier bodies on the way."""
-        raw_header = self.headers.get("Content-Length", "0")
-        try:
-            content_length = int(raw_header)
-        except ValueError:
-            log.warning("Malformed Content-Length %r — rejecting", raw_header)
-            self._json_response(400, {"error": "invalid content-length"})
-            return
-        if content_length < 0:
-            self._json_response(400, {"error": "invalid content-length"})
-            return
-        raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+        raw_body = self._read_body()
+        if raw_body is None:
+            return  # _read_body already sent the error response
 
         try:
             data = json.loads(raw_body)
@@ -224,23 +226,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         if _is_classifier(data):
-            # Capture original values before patching
-            orig_th = data.get("thinking", "absent")
-            orig_re = "yes" if data.get("reasoning_effort") else "no"
-            orig_oc = "yes" if data.get("output_config") else "no"
-            orig_mt = data.get("max_tokens", "?")
-            patched = _patch_classifier(data, self.thinking, self.effort)
+            cfg = self._cfg()
+            patched = _patch_classifier(data, cfg.thinking, cfg.effort)
             raw_body = json.dumps(patched).encode("utf-8")
             t0 = time.monotonic()
             self._forward("POST", raw_body)
-            elapsed = time.monotonic() - t0
-            if self.verbose:
-                log.info("[classifier] %.1fs re=%s oc=%s th=%s max_tok=%s → thinking=%s effort=%s %s",
-                         elapsed, orig_re, orig_oc, orig_th, orig_mt,
-                         self.thinking, self.effort, self.path)
-            else:
-                log.info("[classifier] %.1fs thinking=%s effort=%s %s",
-                         elapsed, self.thinking, self.effort, self.path)
+            self._log_classifier(time.monotonic() - t0, data)
             return
 
         # Structural criteria matched but the signature didn't?
@@ -250,17 +241,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "[structural match — possible prompt change] "
                 "classifier signature not detected, request passed through unpatched"
             )
-        if self.verbose:
-            log.info("[pass] stream=%s tools=%d msgs=%d sys=%s re=%s oc=%s %s",
-                     bool(data.get("stream")),
-                     len(data.get("tools", [])),
-                     len(data.get("messages", [])),
-                     "yes" if data.get("system") else "no",
-                     "yes" if data.get("reasoning_effort") else "no",
-                     "yes" if data.get("output_config") else "no",
-                     self.path)
-        else:
-            log.info("[pass] %s", self.path)
+        self._log_pass(data)
         self._forward("POST", raw_body)
 
     def do_GET(self) -> None:
@@ -272,17 +253,68 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     # ---------- Internals ----------------------------------------------------
 
+    def _cfg(self) -> _ProxyConfig:
+        """Return this server's proxy config (set by build_server)."""
+        server = self.server
+        if not isinstance(server, _ThreadedHTTPServer):
+            raise RuntimeError("ProxyHandler used outside _ThreadedHTTPServer")
+        return server.config
+
+    def _read_body(self) -> bytes | None:
+        """Read the request body; None (after a 400 reply) on malformed length."""
+        raw_header = self.headers.get("Content-Length", "0")
+        try:
+            content_length = int(raw_header)
+        except ValueError:
+            log.warning("Malformed Content-Length %r — rejecting", raw_header)
+            self._json_response(400, {"error": "invalid content-length"})
+            return None
+        if content_length < 0:
+            self._json_response(400, {"error": "invalid content-length"})
+            return None
+        return self.rfile.read(content_length) if content_length > 0 else b""
+
+    def _log_classifier(self, elapsed: float, original: dict) -> None:
+        """Log a patched classifier round-trip (request detail only in verbose)."""
+        cfg = self._cfg()
+        if cfg.verbose:
+            log.info("[classifier] %.1fs re=%s oc=%s th=%s max_tok=%s → thinking=%s effort=%s %s",
+                     elapsed,
+                     "yes" if original.get("reasoning_effort") else "no",
+                     "yes" if original.get("output_config") else "no",
+                     original.get("thinking", "absent"),
+                     original.get("max_tokens", "?"),
+                     cfg.thinking, cfg.effort, self.path)
+        else:
+            log.info("[classifier] %.1fs thinking=%s effort=%s %s",
+                     elapsed, cfg.thinking, cfg.effort, self.path)
+
+    def _log_pass(self, data: dict) -> None:
+        """Log a passed-through request (structure detail only in verbose)."""
+        if self._cfg().verbose:
+            log.info("[pass] stream=%s tools=%d msgs=%d sys=%s re=%s oc=%s %s",
+                     bool(data.get("stream")),
+                     len(data.get("tools", [])),
+                     len(data.get("messages", [])),
+                     "yes" if data.get("system") else "no",
+                     "yes" if data.get("reasoning_effort") else "no",
+                     "yes" if data.get("output_config") else "no",
+                     self.path)
+        else:
+            log.info("[pass] %s", self.path)
+
     def _forward(self, method: str, body: bytes) -> None:
         """Forward *method* request with *body* to upstream; stream response back."""
+        cfg = self._cfg()
         headers_sent = False
-        if self.upstream_use_tls:
+        if cfg.upstream_use_tls:
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
-                self.upstream_host, self.upstream_port,
+                cfg.upstream_host, cfg.upstream_port,
                 context=_get_tls_context(), timeout=120,
             )
         else:
             conn = http.client.HTTPConnection(
-                self.upstream_host, self.upstream_port, timeout=120,
+                cfg.upstream_host, cfg.upstream_port, timeout=120,
             )
 
         try:
@@ -295,7 +327,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             fwd_headers.pop("content-length", None)
             fwd_headers["Content-Length"] = str(len(body))
 
-            upstream_path = self.upstream_base_path + self.path
+            upstream_path = cfg.upstream_base_path + self.path
             conn.request(method, upstream_path, body=body, headers=fwd_headers)
             resp = conn.getresponse()
 
@@ -350,17 +382,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:
         """Suppress default per-request log line (we emit our own)."""
-        pass
+        del format, args  # intentionally unused — must match the base signature
 
 
 class _ThreadedHTTPServer(http.server.ThreadingHTTPServer):
     """Handle requests concurrently so one slow response doesn't block others."""
     allow_reuse_address = True
     daemon_threads = True
+    # Set by build_server(); read by ProxyHandler via _cfg().
+    config: _ProxyConfig
 
 
 def build_server(port: int, upstream_url: str = DEFAULT_UPSTREAM,
-                 verbose: bool = False) -> _ThreadedHTTPServer:
+                 verbose: bool = False, thinking: str = "disabled",
+                 effort: str = "high") -> _ThreadedHTTPServer:
     """Construct a proxy server without touching process-level state.
 
     port=0 binds an ephemeral port (used by tests). Raises ValueError for an
@@ -370,20 +405,24 @@ def build_server(port: int, upstream_url: str = DEFAULT_UPSTREAM,
     if not parsed.hostname:
         raise ValueError(f"Invalid upstream URL: {upstream_url!r}")
 
-    ProxyHandler.upstream_host = parsed.hostname
-    ProxyHandler.upstream_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    ProxyHandler.upstream_base_path = parsed.path or ""
-    ProxyHandler.upstream_use_tls = parsed.scheme == "https"
-    ProxyHandler.verbose = verbose
-
-    return _ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
+    server = _ThreadedHTTPServer(("127.0.0.1", port), ProxyHandler)
+    server.config = _ProxyConfig(
+        upstream_host=parsed.hostname,
+        upstream_port=parsed.port or (443 if parsed.scheme == "https" else 80),
+        upstream_base_path=parsed.path or "",
+        upstream_use_tls=parsed.scheme == "https",
+        verbose=verbose,
+        thinking=thinking,
+        effort=effort,
+    )
+    return server
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def _env_value(name: str, default: str, valid) -> str:
+def _env_value(name: str, default: str, valid: frozenset[str]) -> str:
     """Read an env var; warn (and keep the default) if the value is invalid."""
     value = os.environ.get(name, default)
     if value not in valid:
@@ -500,6 +539,15 @@ def _find_pid_by_port(port: int) -> int | None:
         return None
 
 
+def _try_stop(pid: int, source: str) -> bool:
+    """Kill *pid* and log the outcome; return success."""
+    if _kill_process(pid):
+        log.info("Stopped proxy (PID %d from %s)", pid, source)
+        return True
+    log.warning("Failed to stop PID %d from %s", pid, source)
+    return False
+
+
 def _stop_existing(port: int) -> None:
     """Stop a running proxy instance on *port* — never an unrelated process.
 
@@ -509,10 +557,7 @@ def _stop_existing(port: int) -> None:
     """
     pid = _find_pid_by_port(port)
     if pid is not None:
-        if _kill_process(pid):
-            log.info("Stopped proxy (PID %d bound to port %d)", pid, port)
-        else:
-            log.warning("Failed to stop PID %d bound to port %d", pid, port)
+        _try_stop(pid, f"port {port}")
         return
 
     entry = _read_pid_file()
@@ -520,10 +565,8 @@ def _stop_existing(port: int) -> None:
         file_pid, file_port = entry
         if file_port == port:
             if _process_alive(file_pid):
-                if _kill_process(file_pid):
-                    log.info("Stopped proxy (PID %d from %s)", file_pid, PID_FILE)
-                else:
-                    log.warning("Failed to stop PID %d from %s", file_pid, PID_FILE)
+                # On failure keep the PID file so a later attempt can retry.
+                if not _try_stop(file_pid, PID_FILE):
                     return
             else:
                 log.info("PID file stale (PID %d not running); removing", file_pid)
@@ -539,6 +582,7 @@ def _install_signal_handlers(server) -> None:
         return
 
     def _shutdown(signum, frame) -> None:
+        del signum, frame  # required by the signal handler signature
         log.info("Received SIGTERM, shutting down")
         # shutdown() must run outside the serve_forever thread.
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -577,7 +621,10 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(message)s",
-        datefmt="%H:%M:%S",
+        # Date-aware timestamps (v1.3.1): the log is append-only across days,
+        # and undated HH:MM:SS lines made cross-day investigations ambiguous.
+        # scripts/check_detection.py parses both this and the old format.
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     if args.stop:
@@ -585,11 +632,12 @@ def main() -> None:
         return
 
     # Load classifier config from env; warn and keep defaults on bad values.
-    ProxyHandler.thinking = _env_value("PROXY_THINKING", "disabled", _VALID_THINKING)
-    ProxyHandler.effort = _env_value("PROXY_EFFORT", "high", _VALID_EFFORT)
+    thinking = _env_value("PROXY_THINKING", "disabled", _VALID_THINKING)
+    effort = _env_value("PROXY_EFFORT", "high", _VALID_EFFORT)
 
     try:
-        server = build_server(args.port, args.upstream, args.verbose)
+        server = build_server(args.port, args.upstream, args.verbose,
+                              thinking, effort)
     except ValueError as exc:
         parser.error(str(exc))
     except OSError as exc:

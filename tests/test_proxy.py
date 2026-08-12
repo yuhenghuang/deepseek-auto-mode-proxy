@@ -83,8 +83,8 @@ class _FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
     do_POST = _record_and_reply
     do_GET = _record_and_reply
 
-    def log_message(self, *args) -> None:
-        pass
+    def log_message(self, format: str, *args) -> None:
+        del format, args  # silence the default access log
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ class TestPatchClassifier(unittest.TestCase):
         self.assertEqual(out["output_config"], {"effort": "high"})
 
     def test_max_effort(self):
-        # "max" is the second distinct tier on deepseek-v4-pro (v1.2.0).
+        # "max" is the third distinct tier on deepseek-v4-pro (Aug 2026 docs).
         out = proxy._patch_classifier({"messages": []}, effort="max")
         self.assertEqual(out["output_config"], {"effort": "max"})
 
@@ -278,34 +278,25 @@ class TestProxyPassthrough(ProxyTestCase):
         self.assertEqual(status, 404)
 
     def test_502_when_upstream_down(self):
-        # Save/restore handler attrs: build_server mutates them globally.
-        saved = (proxy.ProxyHandler.upstream_host, proxy.ProxyHandler.upstream_port,
-                 proxy.ProxyHandler.upstream_base_path,
-                 proxy.ProxyHandler.upstream_use_tls)
-        down_server = None
+        # Server-scoped config (v1.3.0): this server's dead upstream must not
+        # affect the shared ProxyTestCase server, even while both run at once.
+        down_server = proxy.build_server(
+            0, f"http://127.0.0.1:{_free_port()}", verbose=False
+        )
+        self.addCleanup(down_server.server_close)
+        threading.Thread(target=down_server.serve_forever, daemon=True).start()
+        self.addCleanup(down_server.shutdown)
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", down_server.server_address[1], timeout=10
+        )
         try:
-            down_server = proxy.build_server(
-                0, f"http://127.0.0.1:{_free_port()}", verbose=False
-            )
-            threading.Thread(target=down_server.serve_forever, daemon=True).start()
-            conn = http.client.HTTPConnection(
-                "127.0.0.1", down_server.server_address[1], timeout=10
-            )
-            try:
-                conn.request("POST", "/v1/messages", body=b'{"stream": true, "messages": []}',
-                             headers={"Content-Type": "application/json"})
-                resp = conn.getresponse()
-                self.assertEqual(resp.status, 502)
-                self.assertIn(b"upstream unreachable", resp.read())
-            finally:
-                conn.close()
+            conn.request("POST", "/v1/messages", body=b'{"stream": true, "messages": []}',
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 502)
+            self.assertIn(b"upstream unreachable", resp.read())
         finally:
-            if down_server is not None:
-                down_server.shutdown()
-                down_server.server_close()
-            (proxy.ProxyHandler.upstream_host, proxy.ProxyHandler.upstream_port,
-             proxy.ProxyHandler.upstream_base_path,
-             proxy.ProxyHandler.upstream_use_tls) = saved
+            conn.close()
 
 
 class TestClassifierThroughProxy(ProxyTestCase):
@@ -352,11 +343,56 @@ class TestEnvValidation(unittest.TestCase):
         )
 
     def test_effort_medium_rejected(self):
-        # "medium" is not a DeepSeek value — must fall back to the default.
+        # "medium" maps to "high" at the model level but is not accepted by
+        # output_config.effort — must fall back to the default.
         os.environ["PROXY_EFFORT"] = "medium"
         self.assertEqual(
             proxy._env_value("PROXY_EFFORT", "high", proxy._VALID_EFFORT), "high"
         )
+
+
+# ---------------------------------------------------------------------------
+# build_server — server-scoped config (v1.3.0)
+# ---------------------------------------------------------------------------
+
+class TestBuildServer(unittest.TestCase):
+    def test_invalid_upstream_raises(self):
+        with self.assertRaises(ValueError):
+            proxy.build_server(0, "not a url")
+
+    def test_parses_upstream_parts(self):
+        server = proxy.build_server(
+            0, "http://example.com:8080/base", verbose=True,
+            thinking="enabled", effort="max",
+        )
+        self.addCleanup(server.server_close)
+        cfg = server.config
+        self.assertEqual(cfg.upstream_host, "example.com")
+        self.assertEqual(cfg.upstream_port, 8080)
+        self.assertEqual(cfg.upstream_base_path, "/base")
+        self.assertFalse(cfg.upstream_use_tls)
+        self.assertTrue(cfg.verbose)
+        self.assertEqual(cfg.thinking, "enabled")
+        self.assertEqual(cfg.effort, "max")
+
+    def test_https_defaults(self):
+        server = proxy.build_server(0)  # default upstream is https
+        self.addCleanup(server.server_close)
+        cfg = server.config
+        self.assertTrue(cfg.upstream_use_tls)
+        self.assertEqual(cfg.upstream_port, 443)
+        self.assertEqual(cfg.upstream_base_path, "/anthropic")
+        self.assertFalse(cfg.verbose)
+        self.assertEqual((cfg.thinking, cfg.effort), ("disabled", "high"))
+
+    def test_servers_do_not_share_config(self):
+        # Regression guard: before v1.3.0, build_server wrote upstream config
+        # into ProxyHandler class attributes — two servers could not coexist.
+        a = proxy.build_server(0, "http://a.example:1")
+        b = proxy.build_server(0, "http://b.example:2")
+        self.addCleanup(a.server_close)
+        self.addCleanup(b.server_close)
+        self.assertNotEqual(a.config.upstream_host, b.config.upstream_host)
 
 
 # ---------------------------------------------------------------------------
