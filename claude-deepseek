@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# claude-deepseek — run Claude Code through the DeepSeek auto-mode proxy.
+#
+# Claude Code's auto-mode safety classifier makes a non-streaming request that
+# DeepSeek V4 Pro answers only after its default "thinking" phase (~28–32s),
+# exceeding Claude Code's ~30s classifier timeout. proxy.py fixes this by
+# forcing `thinking: disabled` *only* on classifier requests.
+#
+# This launcher automates the manual quick-start (start proxy -> point Claude
+# Code at it -> run) and adds session lifecycle: the proxy is started on launch
+# and stopped (by a detached watchdog) when Claude Code exits, so it only runs
+# while you are using claude-deepseek.
+#
+# Usage:
+#   ./claude-deepseek [claude args...]      e.g. ./claude-deepseek --permission-mode auto
+#   ./claude-deepseek status                show whether the proxy is running
+#   ./claude-deepseek stop                  stop the proxy
+#
+# Environment:
+#   CLAUDE_DS_PORT       proxy listen port      (default: 8799)
+#   CLAUDE_DS_UPSTREAM   provider base URL      (default: $ANTHROPIC_BASE_URL,
+#                                                then https://api.deepseek.com/anthropic)
+#   CLAUDE_DS_DRY_RUN=1  start proxy, print the launch, don't exec claude
+#   CLAUDE_DS_CLAUDE_BIN path to claude binary  (default: resolved from $PATH)
+#
+# Requirements: bash, python3 (3.7+), curl, and `claude` on $PATH.
+
+set -euo pipefail
+
+# Resolve the directory containing this script, following symlinks.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+PORT="${CLAUDE_DS_PORT:-8799}"
+PROXY_PY="$SCRIPT_DIR/proxy.py"
+HEALTH_URL="http://127.0.0.1:${PORT}/health"
+LOG_FILE="${TMPDIR:-/tmp}/deepseek-auto-mode-proxy.log"
+
+DEFAULT_UPSTREAM="https://api.deepseek.com/anthropic"
+
+# Resolve the upstream the proxy forwards to:
+#   1. $CLAUDE_DS_UPSTREAM
+#   2. the ANTHROPIC_BASE_URL already exported by your shell
+#   3. the default above
+UPSTREAM="${CLAUDE_DS_UPSTREAM:-}"
+if [[ -z "$UPSTREAM" ]]; then
+  UPSTREAM="${ANTHROPIC_BASE_URL:-$DEFAULT_UPSTREAM}"
+fi
+# Don't point the proxy at itself (a leftover localhost export).
+case "$UPSTREAM" in
+  http://127.0.0.1:*|http://localhost:*) UPSTREAM="$DEFAULT_UPSTREAM" ;;
+esac
+
+proxy_running() {
+  curl -fsS --max-time 2 "$HEALTH_URL" >/dev/null 2>&1
+}
+
+start_proxy() {
+  echo "→ starting proxy (upstream: $UPSTREAM)" >&2
+  nohup python3 "$PROXY_PY" --upstream "$UPSTREAM" --port "$PORT" \
+    >> "$LOG_FILE" 2>&1 &
+  for _ in $(seq 1 20); do
+    proxy_running && break
+    sleep 0.25
+  done
+  if proxy_running; then
+    echo "✓ proxy up on :$PORT" >&2
+  else
+    echo "✗ proxy failed to start — see $LOG_FILE" >&2
+    exit 1
+  fi
+}
+
+# --- subcommands -----------------------------------------------------------
+case "${1:-}" in
+  stop)
+    python3 "$PROXY_PY" --port "$PORT" --stop
+    exit $?
+    ;;
+  status)
+    if proxy_running; then
+      echo "proxy running on :$PORT — $(curl -sS --max-time 2 "$HEALTH_URL")"
+    else
+      echo "proxy NOT running on :$PORT"
+    fi
+    exit 0
+    ;;
+esac
+
+# --- main path: ensure the proxy is up, then run Claude Code ----------------
+proxy_running || start_proxy
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:${PORT}"
+
+CLAUDE_BIN="${CLAUDE_DS_CLAUDE_BIN:-$(command -v claude || true)}"
+if [[ -z "$CLAUDE_BIN" ]]; then
+  echo "✗ 'claude' not found on PATH" >&2
+  exit 1
+fi
+
+if [[ "${CLAUDE_DS_DRY_RUN:-}" == "1" ]]; then
+  echo "→ dry-run: would exec '$CLAUDE_BIN $*' with ANTHROPIC_BASE_URL=$ANTHROPIC_BASE_URL" >&2
+  exit 0
+fi
+
+# Detached watchdog: stop the proxy once this process exits. After `exec`
+# below this PID becomes Claude Code, so the watchdog fires when claude quits.
+# It ignores terminal signals, so Ctrl-C (which goes to the foreground claude)
+# or closing the terminal can't kill it before it cleans up.
+LAUNCHER_PID=$$
+(
+  trap '' HUP INT QUIT TERM
+  while kill -0 "$LAUNCHER_PID" 2>/dev/null; do sleep 1; done
+  python3 "$PROXY_PY" --port "$PORT" --stop >/dev/null 2>&1 || true
+) &
+
+exec "$CLAUDE_BIN" "$@"
