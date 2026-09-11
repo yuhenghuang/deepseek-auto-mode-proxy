@@ -12,6 +12,7 @@ Run from the repo root with::
 
 from __future__ import annotations
 
+import gzip
 import http.client
 import http.server
 import json
@@ -314,6 +315,294 @@ class TestClassifierThroughProxy(ProxyTestCase):
         # Unrelated fields must survive the patch untouched.
         self.assertEqual(parsed["max_tokens"], 2112)
         self.assertEqual(parsed["system"], _CLASSIFIER + " 350 lines of security policy...")
+
+
+# ---------------------------------------------------------------------------
+# Usage reporting (v1.4.0) — unit level
+# ---------------------------------------------------------------------------
+
+class TestTelemetryUrlResolution(unittest.TestCase):
+    """PROXY_TELEMETRY_PATH is resolved against OTEL_EXPORTER_OTLP_ENDPOINT."""
+
+    def test_path_joins_endpoint(self):
+        self.assertEqual(
+            proxy.resolve_telemetry_url("/classifier", "http://localhost:4318"),
+            "http://localhost:4318/classifier",
+        )
+
+    def test_slashes_are_normalised(self):
+        for path, endpoint in (("classifier", "http://h:1/"),
+                               ("/classifier", "http://h:1"),
+                               ("//classifier", "http://h:1//")):
+            self.assertEqual(
+                proxy.resolve_telemetry_url(path, endpoint),
+                "http://h:1/classifier", f"{endpoint!r} + {path!r}",
+            )
+
+    def test_unset_path_disables_reporting(self):
+        self.assertEqual(proxy.resolve_telemetry_url("", "http://localhost:4318"), "")
+
+    def test_path_without_endpoint_disables_reporting(self):
+        # Honours the path but cannot place it: must degrade, not crash.
+        self.assertEqual(proxy.resolve_telemetry_url("/classifier", ""), "")
+
+    def test_whitespace_only_values_are_treated_as_unset(self):
+        self.assertEqual(proxy.resolve_telemetry_url("  ", "http://h:1"), "")
+        self.assertEqual(proxy.resolve_telemetry_url("/classifier", "  "), "")
+
+
+class TestCaptureHelpers(unittest.TestCase):
+    def test_gzip_requested_when_client_accepts_it(self):
+        for value in ("gzip", "gzip, deflate, br, zstd", "br;q=0.8, gzip;q=1.0",
+                      "GZIP"):
+            self.assertEqual(proxy._capture_accept_encoding(value), "gzip", value)
+
+    def test_identity_when_client_cannot_take_gzip(self):
+        # br/zstd alone are undecodable by the stdlib, so ask for plaintext.
+        for value in ("", "br", "zstd, br", "identity"):
+            self.assertEqual(proxy._capture_accept_encoding(value), "identity", value)
+
+    def test_decode_identity_and_gzip(self):
+        raw = b'{"usage":{"output_tokens":7}}'
+        self.assertEqual(proxy._decode_response_body(raw, ""), raw)
+        self.assertEqual(proxy._decode_response_body(raw, "identity"), raw)
+        self.assertEqual(
+            proxy._decode_response_body(gzip.compress(raw), "gzip"), raw
+        )
+
+    def test_decode_rejects_undecodable_encoding(self):
+        with self.assertRaises(ValueError):
+            proxy._decode_response_body(b"x", "br")
+
+    def test_timestamp_is_iso_with_z(self):
+        ts = proxy._utc_now_iso()
+        self.assertTrue(ts.endswith("Z"))
+        self.assertRegex(ts, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+
+class _SinkHandler(http.server.BaseHTTPRequestHandler):
+    """Stand-in telemetry sink — records what the proxy POSTs to it."""
+
+    records: list = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length > 0 else b""
+        _SinkHandler.records.append((self.path, dict(self.headers), body))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, format: str, *args) -> None:
+        del format, args
+
+
+class TestUsageReportingIntegration(unittest.TestCase):
+    """End-to-end: classifier responses reach the sink, others don't."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _FakeUpstreamHandler
+        )
+        cls.upstream_port = cls.upstream.server_address[1]
+        cls.sink = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SinkHandler)
+        cls.sink_port = cls.sink.server_address[1]
+        cls.proxy_server = proxy.build_server(
+            0, f"http://127.0.0.1:{cls.upstream_port}", verbose=False,
+            telemetry_url=f"http://127.0.0.1:{cls.sink_port}/classifier",
+        )
+        cls.proxy_port = cls.proxy_server.server_address[1]
+        cls._threads = [
+            threading.Thread(target=srv.serve_forever, daemon=True)
+            for srv in (cls.upstream, cls.sink, cls.proxy_server)
+        ]
+        for t in cls._threads:
+            t.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for srv in (cls.upstream, cls.sink, cls.proxy_server):
+            srv.shutdown()
+            srv.server_close()
+
+    def setUp(self):
+        _FakeUpstreamHandler.requests.clear()
+        _SinkHandler.records.clear()
+        _FakeUpstreamHandler.response_headers = [("Content-Type", "application/json")]
+        _FakeUpstreamHandler.response_body = b'{"id":"upstream"}'
+
+    def _post(self, body: bytes, accept_encoding: str | None = None):
+        headers = {"Content-Type": "application/json"}
+        if accept_encoding is not None:
+            headers["Accept-Encoding"] = accept_encoding
+        headers[proxy._SESSION_HEADER] = "sess-1234"
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        try:
+            conn.request("POST", "/v1/messages", body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.headers), resp.read()
+        finally:
+            conn.close()
+
+    def _await_sink(self, count: int = 1, timeout: float = 5.0) -> list:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if len(_SinkHandler.records) >= count:
+                return list(_SinkHandler.records)
+            time.sleep(0.05)
+        return list(_SinkHandler.records)
+
+    def test_classifier_usage_is_reported(self):
+        payload = {
+            "id": "msg_1", "model": "deepseek-flash",
+            "usage": {
+                "input_tokens": 34815, "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0, "output_tokens": 138,
+                "server_tool_use": {"web_search_requests": 0},
+            },
+        }
+        _FakeUpstreamHandler.response_body = json.dumps(payload).encode()
+
+        status, _, resp_body = self._post(
+            json.dumps(_classifier_body()).encode(), accept_encoding="gzip, br, zstd"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(resp_body, _FakeUpstreamHandler.response_body)
+
+        records = self._await_sink()
+        self.assertEqual(len(records), 1, "classifier usage must be reported once")
+        path, _, body = records[0]
+        self.assertEqual(path, "/classifier")
+        record = json.loads(body)
+        self.assertEqual(record["session_id"], "sess-1234")
+        self.assertEqual(record["model"], "deepseek-flash")
+        self.assertEqual(record["usage"], {
+            "input_tokens": 34815,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 138,
+        })
+        # Nested/unknown keys must not leak into the report.
+        self.assertNotIn("server_tool_use", record["usage"])
+
+    def test_gzipped_response_is_decoded_for_the_sink_only(self):
+        payload = {"model": "deepseek-flash",
+                   "usage": {"input_tokens": 5, "output_tokens": 6}}
+        raw = json.dumps(payload).encode()
+        compressed = gzip.compress(raw)
+        _FakeUpstreamHandler.response_headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Encoding", "gzip"),
+        ]
+        try:
+            _FakeUpstreamHandler.response_body = compressed
+            status, headers, resp_body = self._post(
+                json.dumps(_classifier_body()).encode(), accept_encoding="gzip, br"
+            )
+            # The client's bytes are the upstream's, untouched...
+            self.assertEqual(status, 200)
+            self.assertEqual(resp_body, compressed)
+            self.assertEqual(headers.get("Content-Encoding"), "gzip")
+        finally:
+            _FakeUpstreamHandler.response_headers = [
+                ("Content-Type", "application/json")
+            ]
+            _FakeUpstreamHandler.response_body = b'{"id":"upstream"}'
+
+        records = self._await_sink()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0][2])["usage"],
+                         {"input_tokens": 5, "output_tokens": 6})
+
+    def test_accept_encoding_is_narrowed_only_when_capturing(self):
+        self._post(json.dumps(_classifier_body()).encode(),
+                   accept_encoding="gzip, deflate, br, zstd")
+        _, _, headers, _ = _FakeUpstreamHandler.requests[0]
+        self.assertEqual(headers.get("Accept-Encoding"), "gzip")
+
+    def test_conversation_request_is_not_captured(self):
+        body = json.dumps({
+            "model": "deepseek-flash[1m]",
+            "stream": True,
+            "tools": [{"name": "Bash"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }).encode()
+        self._post(body, accept_encoding="gzip, deflate, br, zstd")
+
+        # Client's own header stands — the proxy must not rewrite encodings
+        # for traffic it isn't measuring.
+        _, _, headers, _ = _FakeUpstreamHandler.requests[0]
+        self.assertEqual(headers.get("Accept-Encoding"),
+                         "gzip, deflate, br, zstd")
+
+        time.sleep(0.5)  # give a stray reporter thread time to appear
+        self.assertEqual(_SinkHandler.records, [],
+                         "conversation calls are telemetry's job, not the proxy's")
+
+    def test_structurally_matching_drift_case_is_still_captured(self):
+        # Signature check failed (prompt drift) but structurally classifier-
+        # shaped — the population that would otherwise vanish silently.
+        _FakeUpstreamHandler.response_body = json.dumps({
+            "model": "deepseek-flash",
+            "usage": {"input_tokens": 11, "output_tokens": 22},
+        }).encode()
+        body = json.dumps({
+            "model": "deepseek-flash[1m]", "stream": False, "messages": [],
+            "system": "A NEW security monitor prompt we have never seen",
+        }).encode()
+        self._post(body, accept_encoding="gzip")
+
+        records = self._await_sink()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0][2])["usage"],
+                         {"input_tokens": 11, "output_tokens": 22})
+
+    def test_response_without_usage_reports_nothing(self):
+        _FakeUpstreamHandler.response_body = b'{"id":"msg","model":"deepseek-flash"}'
+        self._post(json.dumps(_classifier_body()).encode(), accept_encoding="gzip")
+        time.sleep(0.5)
+        self.assertEqual(_SinkHandler.records, [])
+
+
+class TestUsageReportingDisabled(unittest.TestCase):
+    """With usage reporting unconfigured the proxy must behave exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.upstream = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _FakeUpstreamHandler
+        )
+        cls.proxy_server = proxy.build_server(
+            0, f"http://127.0.0.1:{cls.upstream.server_address[1]}"
+        )
+        cls.proxy_port = cls.proxy_server.server_address[1]
+        for srv in (cls.upstream, cls.proxy_server):
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        for srv in (cls.upstream, cls.proxy_server):
+            srv.shutdown()
+            srv.server_close()
+
+    def test_default_config_has_no_telemetry_url(self):
+        self.assertEqual(self.proxy_server.config.telemetry_url, "")
+
+    def test_classifier_accept_encoding_untouched(self):
+        _FakeUpstreamHandler.requests.clear()
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        try:
+            conn.request("POST", "/v1/messages",
+                         body=json.dumps(_classifier_body()).encode(),
+                         headers={"Content-Type": "application/json",
+                                  "Accept-Encoding": "gzip, br, zstd"})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            conn.close()
+        _, _, headers, _ = _FakeUpstreamHandler.requests[0]
+        self.assertEqual(headers.get("Accept-Encoding"), "gzip, br, zstd")
 
 
 class TestEnvValidation(unittest.TestCase):

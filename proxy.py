@@ -32,6 +32,29 @@ Environment::
     PROXY_THINKING=disabled|enabled  (default: disabled)
     PROXY_EFFORT=low|high|max       (default: high)
     PROXY_PID_FILE=<path>            (default: tempdir/deepseek-proxy.pid)
+    PROXY_TELEMETRY_PATH=<path>      (default: unset — no usage reporting)
+
+Usage reporting (optional, off by default)::
+
+    Classifier requests are invisible to Claude Code's own OpenTelemetry
+    export, so their token usage can only be observed here, at the seam where
+    the proxy already sees the response.  Set PROXY_TELEMETRY_PATH to a path
+    and every structurally-classifier-shaped request (``_structural_match`` —
+    including ones whose signature check failed, i.e. prompt drift) has its
+    response teed, decoded, and POSTed there as::
+
+        {"ts": ..., "model": ..., "session_id": ..., "usage": {...}}
+
+    The path is resolved against OTEL_EXPORTER_OTLP_ENDPOINT — the same
+    endpoint Claude Code already exports its own telemetry to — so the host and
+    port are configured once, not twice.  With the endpoint
+    ``http://localhost:4318``, ``PROXY_TELEMETRY_PATH=/classifier`` posts to
+    ``http://localhost:4318/classifier``.
+
+    The proxy never parses the request body for content and never logs it; only
+    the response's ``usage`` block is read.  Reporting happens on a background
+    thread after the response has been flushed to the client, so it cannot add
+    latency, and failures are logged rather than raised.
 
 Then configure Claude Code::
 
@@ -48,6 +71,7 @@ Tests: ``python3 -m unittest discover -s tests -v`` (offline, stdlib only).
 from __future__ import annotations
 
 import argparse
+import gzip
 import http.client
 import http.server
 import json
@@ -61,12 +85,14 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 log = logging.getLogger("deepseek-proxy")
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 DEFAULT_UPSTREAM = "https://api.deepseek.com/anthropic"
 DEFAULT_PORT = 8799
@@ -180,6 +206,122 @@ def _forward_headers(source, sink_dict: dict[str, str]) -> None:
             sink_dict[key] = value
 
 
+# ---------------------------------------------------------------------------
+# Usage reporting (PROXY_TELEMETRY_PATH) — optional, off by default
+# ---------------------------------------------------------------------------
+
+# Classifier responses are small (~1 KB); this only bounds the damage if a
+# non-classifier request ever matches the structural criteria.
+_MAX_CAPTURE_BYTES = 8 * 1024 * 1024
+_TELEMETRY_TIMEOUT = 5.0
+
+# The Anthropic-compatible usage keys the sink understands. Anything else in
+# the response's usage block (nested cache_creation, server_tool_use) is left
+# for the sink to derive.
+_USAGE_KEYS = (
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+)
+
+# The header Claude Code stamps on every request with the session UUID, which
+# is what the telemetry sink uses to attribute the call to a project.
+_SESSION_HEADER = "X-Claude-Code-Session-Id"
+
+
+def resolve_telemetry_url(path: str, endpoint: str) -> str:
+    """Absolute sink URL for usage reports, or "" to disable reporting.
+
+    *path* is ``PROXY_TELEMETRY_PATH`` and *endpoint* is
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` — the endpoint Claude Code already exports
+    its own telemetry to, so the host:port is configured once for both.
+    Returns "" when either is missing.
+    """
+    path = (path or "").strip()
+    if not path:
+        return ""
+    base = (endpoint or "").strip()
+    if not base:
+        log.warning(
+            "PROXY_TELEMETRY_PATH=%r is set but OTEL_EXPORTER_OTLP_ENDPOINT is "
+            "not — usage reporting disabled", path,
+        )
+        return ""
+    return base.rstrip("/") + "/" + path.lstrip("/")
+
+
+def _capture_accept_encoding(client_value: str) -> str:
+    """Response encoding to request upstream when teeing the response.
+
+    Claude Code advertises ``br``/``zstd``, which Python's stdlib cannot
+    decode. gzip is requested when the client accepts it — the bytes forwarded
+    to the client are unchanged, and the proxy decodes only its own copy —
+    otherwise plain ``identity``.
+    """
+    for part in (client_value or "").split(","):
+        if part.split(";", 1)[0].strip().lower() == "gzip":
+            return "gzip"
+    return "identity"
+
+
+def _decode_response_body(raw: bytes, content_encoding: str) -> bytes:
+    """Undo the response's Content-Encoding (only gzip is decodable here)."""
+    encoding = (content_encoding or "").strip().lower()
+    if encoding in ("", "identity"):
+        return raw
+    if encoding in ("gzip", "x-gzip"):
+        return gzip.decompress(raw)
+    raise ValueError(f"cannot decode Content-Encoding {content_encoding!r}")
+
+
+def _utc_now_iso() -> str:
+    """Millisecond UTC timestamp with a Z suffix (for lib.iso_to_ns)."""
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _report_usage(url: str, raw: bytes, content_encoding: str,
+                  capture: dict) -> None:
+    """POST one captured classifier response's usage to the sink.
+
+    Best-effort: every failure is logged and swallowed, because telemetry must
+    never affect request handling. The request body is never inspected — only
+    the response's ``usage`` block leaves this function.
+    """
+    try:
+        body = json.loads(_decode_response_body(raw, content_encoding))
+        if not isinstance(body, dict):
+            return
+        usage = body.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        record = {
+            "ts": _utc_now_iso(),
+            "model": body.get("model") or capture.get("request_model", ""),
+            "session_id": capture.get("session_id", ""),
+            "usage": {
+                key: value
+                for key, value in ((k, usage.get(k)) for k in _USAGE_KEYS)
+                if isinstance(value, int)
+            },
+        }
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(record).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=_TELEMETRY_TIMEOUT) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001 — telemetry must never propagate
+        log.warning("[usage] report failed: %s", exc)
+
+
 @dataclass(frozen=True)
 class _ProxyConfig:
     """Immutable per-server configuration, set once by build_server().
@@ -195,6 +337,8 @@ class _ProxyConfig:
     verbose: bool
     thinking: str
     effort: str
+    # Sink for classifier usage reports; "" disables reporting entirely.
+    telemetry_url: str = ""
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -230,7 +374,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             patched = _patch_classifier(data, cfg.thinking, cfg.effort)
             raw_body = json.dumps(patched).encode("utf-8")
             t0 = time.monotonic()
-            self._forward("POST", raw_body)
+            self._forward("POST", raw_body, capture=self._capture_ctx(data))
             self._log_classifier(time.monotonic() - t0, data)
             return
 
@@ -242,7 +386,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 "classifier signature not detected, request passed through unpatched"
             )
         self._log_pass(data)
-        self._forward("POST", raw_body)
+        self._forward("POST", raw_body, capture=self._capture_ctx(data))
 
     def do_GET(self) -> None:
         """Health-check endpoint."""
@@ -289,6 +433,24 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             log.info("[classifier] %.1fs thinking=%s effort=%s %s",
                      elapsed, cfg.thinking, cfg.effort, self.path)
 
+    def _capture_ctx(self, data: dict) -> dict | None:
+        """Context for teeing this response to the usage sink, or None.
+
+        Only classifier-shaped requests are captured — they are the ones no
+        Claude Code telemetry reports. The check is ``_structural_match``, not
+        ``_is_classifier``, so requests whose signature check failed (prompt
+        drift) are still measured rather than silently dropped. Everything the
+        reporter needs is snapshotted here because ``self.headers`` is only
+        valid for the life of the handler.
+        """
+        cfg = self._cfg()
+        if not cfg.telemetry_url or not _structural_match(data):
+            return None
+        return {
+            "session_id": self.headers.get(_SESSION_HEADER, ""),
+            "request_model": data.get("model", ""),
+        }
+
     def _log_pass(self, data: dict) -> None:
         """Log a passed-through request (structure detail only in verbose)."""
         if self._cfg().verbose:
@@ -303,10 +465,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         else:
             log.info("[pass] %s", self.path)
 
-    def _forward(self, method: str, body: bytes) -> None:
-        """Forward *method* request with *body* to upstream; stream response back."""
+    def _forward(self, method: str, body: bytes,
+                 capture: dict | None = None) -> None:
+        """Forward *method* request with *body* to upstream; stream response back.
+
+        When *capture* is given, the response is also teed into memory and
+        handed to a background reporter once the client has been served — the
+        bytes sent to the client are untouched either way.
+        """
         cfg = self._cfg()
         headers_sent = False
+        captured: bytearray | None = bytearray() if capture else None
         if cfg.upstream_use_tls:
             conn: http.client.HTTPConnection = http.client.HTTPSConnection(
                 cfg.upstream_host, cfg.upstream_port,
@@ -326,6 +495,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             fwd_headers.pop("Content-Length", None)
             fwd_headers.pop("content-length", None)
             fwd_headers["Content-Length"] = str(len(body))
+            if capture:
+                # Replace (not add to) any client copy, regardless of case.
+                for key in [k for k in fwd_headers if k.lower() == "accept-encoding"]:
+                    del fwd_headers[key]
+                fwd_headers["Accept-Encoding"] = _capture_accept_encoding(
+                    self.headers.get("Accept-Encoding", "")
+                )
 
             upstream_path = cfg.upstream_base_path + self.path
             conn.request(method, upstream_path, body=body, headers=fwd_headers)
@@ -355,8 +531,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 chunk = resp.read(8192)
                 if not chunk:
                     break
+                if captured is not None and len(captured) < _MAX_CAPTURE_BYTES:
+                    captured += chunk[: _MAX_CAPTURE_BYTES - len(captured)]
                 self.wfile.write(chunk)
                 self.wfile.flush()
+
+            # Report only after the client has the whole response. The reporter
+            # runs on a daemon thread and is never waited on, so a slow or dead
+            # sink cannot delay or fail the proxied request.
+            if capture is not None and captured:
+                threading.Thread(
+                    target=_report_usage,
+                    args=(cfg.telemetry_url, bytes(captured),
+                          resp.headers.get("Content-Encoding", ""), capture),
+                    name="usage-report",
+                    daemon=True,
+                ).start()
 
         except Exception as exc:
             log.error("Upstream unreachable: %s", exc)
@@ -395,7 +585,7 @@ class _ThreadedHTTPServer(http.server.ThreadingHTTPServer):
 
 def build_server(port: int, upstream_url: str = DEFAULT_UPSTREAM,
                  verbose: bool = False, thinking: str = "disabled",
-                 effort: str = "high") -> _ThreadedHTTPServer:
+                 effort: str = "high", telemetry_url: str = "") -> _ThreadedHTTPServer:
     """Construct a proxy server without touching process-level state.
 
     port=0 binds an ephemeral port (used by tests). Raises ValueError for an
@@ -414,6 +604,7 @@ def build_server(port: int, upstream_url: str = DEFAULT_UPSTREAM,
         verbose=verbose,
         thinking=thinking,
         effort=effort,
+        telemetry_url=telemetry_url,
     )
     return server
 
@@ -634,10 +825,14 @@ def main() -> None:
     # Load classifier config from env; warn and keep defaults on bad values.
     thinking = _env_value("PROXY_THINKING", "disabled", _VALID_THINKING)
     effort = _env_value("PROXY_EFFORT", "high", _VALID_EFFORT)
+    telemetry_url = resolve_telemetry_url(
+        os.environ.get("PROXY_TELEMETRY_PATH", ""),
+        os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+    )
 
     try:
         server = build_server(args.port, args.upstream, args.verbose,
-                              thinking, effort)
+                              thinking, effort, telemetry_url)
     except ValueError as exc:
         parser.error(str(exc))
     except OSError as exc:
@@ -655,6 +850,10 @@ def main() -> None:
     log.info("DeepSeek auto-mode proxy %s listening on http://127.0.0.1:%d",
              __version__, args.port)
     log.info("Upstream: %s", args.upstream)
+    if telemetry_url:
+        log.info("Classifier usage reports: %s", telemetry_url)
+    else:
+        log.info("Classifier usage reports: disabled (PROXY_TELEMETRY_PATH unset)")
     log.info(
         "Configure Claude Code with:  ANTHROPIC_BASE_URL=http://127.0.0.1:%d",
         args.port,
