@@ -86,7 +86,7 @@ The path is resolved against `OTEL_EXPORTER_OTLP_ENDPOINT` — the endpoint Clau
 With it set, every structurally-classifier-shaped request — the same `_structural_match` test used for detection, so requests whose signature check failed (prompt drift) are measured too, rather than silently vanishing — has its response teed and POSTed as:
 
 ```json
-{"ts": "2026-09-11T13:51:11.105Z", "model": "deepseek-flash",
+{"ts": "<ISO 8601 UTC>", "model": "deepseek-flash",
  "session_id": "6db675ec-…", "usage": {"input_tokens": 34815, "output_tokens": 138}}
 ```
 
