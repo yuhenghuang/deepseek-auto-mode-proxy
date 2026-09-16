@@ -40,6 +40,32 @@ Stop the proxy:
 python3 proxy.py --stop
 ```
 
+## Launcher
+
+The repo also ships a small wrapper, `claude-deepseek`, that automates the quick
+start above and ties the proxy's lifetime to the session — it starts the proxy,
+runs Claude Code pointed at it, and stops the proxy when Claude Code exits.
+
+```bash
+./claude-deepseek                          # start proxy + launch claude (stops on exit)
+./claude-deepseek --permission-mode auto   # ...with auto mode enabled
+./claude-deepseek status                   # is the proxy running?
+./claude-deepseek stop                     # stop the proxy
+```
+
+`claude-deepseek` derives the upstream from the `ANTHROPIC_BASE_URL` already
+exported in your shell, so it works with `https://api.deepseek.com/anthropic`
+(the default) or any Anthropic-compatible gateway. Override with
+`CLAUDE_DS_UPSTREAM` if needed. Requires `bash`, `python3` (3.7+), `curl`, and
+`claude` on `$PATH`.
+
+| Variable               | Default                | Meaning                           |
+| ---------------------- | ---------------------- | --------------------------------- |
+| `CLAUDE_DS_PORT`       | `8799`                 | proxy listen port                 |
+| `CLAUDE_DS_UPSTREAM`   | `$ANTHROPIC_BASE_URL`  | provider the proxy forwards to    |
+| `CLAUDE_DS_DRY_RUN`    | unset                  | `1` = start proxy, print, no exec |
+| `CLAUDE_DS_CLAUDE_BIN` | `claude` on `$PATH`    | path to the `claude` binary       |
+
 ## Configuration
 
 | Variable / flag  | Values                  | Default                              |
