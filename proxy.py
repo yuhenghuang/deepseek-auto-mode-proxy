@@ -158,17 +158,27 @@ def _structural_match(body: dict) -> bool:
     return len(body.get("messages", [])) <= 2
 
 
+# 2026-10-24 - bfields - Added support for the billing header
 def _signature_match(body: dict) -> bool:
-    """Criterion 4: system prompt opens with the classifier's signature."""
+    """Match classifier signature following optional metadata lines.
+
+    Supports a string or an array of Anthropic system text blocks.
+    """
     system = body.get("system", "")
-    if isinstance(system, str):
-        return system.startswith(_CLASSIFIER_SIGNATURE)
-    if isinstance(system, list) and len(system) > 0:
-        first = system[0]
-        if isinstance(first, dict):
-            text = first.get("text", "")
-            if isinstance(text, str):
-                return text.startswith(_CLASSIFIER_SIGNATURE)
+    if isinstance(system, list):
+        system = "\n".join(
+            block.get("text", "")
+            for block in system
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    if not isinstance(system, str):
+        return False
+
+    for line in system.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.lower().startswith("x-anthropic-billing-header:"):
+            continue
+        return stripped.startswith(_CLASSIFIER_SIGNATURE)
     return False
 
 
@@ -371,20 +381,53 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         if _is_classifier(data):
             cfg = self._cfg()
+            original = data.copy()
             patched = _patch_classifier(data, cfg.thinking, cfg.effort)
             raw_body = json.dumps(patched).encode("utf-8")
+            log.info(
+                "[DEBUG] Classifier recognized and patched: thinking=%s effort=%s",
+                cfg.thinking, cfg.effort,
+            )
             t0 = time.monotonic()
             self._forward("POST", raw_body, capture=self._capture_ctx(data))
-            self._log_classifier(time.monotonic() - t0, data)
+            self._log_classifier(time.monotonic() - t0, original)
             return
 
         # Structural criteria matched but the signature didn't?
         # This may indicate a Claude Code update changed the prompt.
+        # log the actual request if an error
         if _structural_match(data):
+            cfg = self._cfg()
+            
+            scheme = "https" if cfg.upstream_use_tls else "http"
+            host = cfg.upstream_host
+            port = cfg.upstream_port
+            upstream_path = cfg.upstream_base_path + self.path
+            
+            request_url = f"{scheme}://{host}:{port}{upstream_path}"
+            
             log.warning(
                 "[structural match — possible prompt change] "
                 "classifier signature not detected, request passed through unpatched"
             )
+            log.warning("[DEBUG] Upstream request URL: %s", request_url)
+            log.warning("[DEBUG] System field type: %s; blocks: %s",
+                        type(data.get("system")).__name__,
+                        len(data["system"]) if isinstance(data.get("system"), list) else "n/a")
+            system = data.get("system", "")
+    
+            if isinstance(system, list):
+                system = "\n".join(
+                    item.get("text", "")
+                    for item in system
+                    if isinstance(item, dict)
+            )
+
+            log.warning(
+                 "[DEBUG] System prompt prefix: %r",
+                 system[:500]
+            )
+
         self._log_pass(data)
         self._forward("POST", raw_body, capture=self._capture_ctx(data))
 
@@ -506,6 +549,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             upstream_path = cfg.upstream_base_path + self.path
             conn.request(method, upstream_path, body=body, headers=fwd_headers)
             resp = conn.getresponse()
+            if resp.status >= 400:
+                log.warning(
+                    "[UPSTREAM ERROR] HTTP %d %s path=%s",
+                    resp.status, resp.reason, upstream_path,
+                )
 
             # Send status line
             self.send_response(resp.status)
